@@ -1,52 +1,66 @@
 # 小伴：可评测的长期记忆陪伴 Agent
 
-This repository is a local prototype for a voice-enabled companion Agent. Its
-core focus is now **Agent evaluation and optimisation**: reproducible tool-use,
-long-term-memory, and safety evaluation, plus structured execution traces for
-error analysis. Hardware and voice integrations are optional extensions rather
-than the product's primary story.
+本仓库是一个支持语音交互的陪伴型 Agent 本地原型。
 
-The current codebase is split into two services:
+当前代码库主要拆分为两个服务：
 
-- `HDZB_ASR`: audio gateway service. It receives uploaded audio, runs FunASR speech recognition, optionally identifies the speaker, and forwards recognized text to an AI service.
-- `HDZB_agent`: AI Agent service. It handles companion chat, weather lookup, system-intent recognition, simple memory, and family-member information.
+* `HDZB_ASR`：音频网关服务。负责接收上传音频，使用 FunASR 进行语音识别，可选执行说话人识别，并将识别出的文本转发给 AI 服务。
+* `HDZB_agent`：AI Agent 服务。负责陪伴式对话、天气查询、系统意图识别、简单记忆管理以及家庭成员信息管理。
 
-The intended product direction is a companion Agent with two interaction modes:
+项目预期发展为具备两种主要交互模式的陪伴型 Agent：
 
-- Child mode: safe storytelling, learning, emotional comfort, and parent-configured boundaries.
-- Elder mode: warm companionship, reminders, weather, family contact support, and simple device commands.
+* 儿童模式：安全故事、学习陪伴、情绪安抚，以及由家长配置的使用边界。
+* 老人模式：温暖陪伴、提醒事项、天气查询、家庭联系人支持，以及简单的设备控制。
 
-## Current Local Architecture
+## 当前本地架构
 
 ```text
-Audio file / device microphone
+音频文件 / 设备麦克风
         |
         v
-HDZB_ASR on port 8015
-  - upload audio
-  - ASR transcription
-  - speaker recognition
-  - gateway to Agent
+HDZB_ASR，端口 8015
+  - 上传音频
+  - ASR 语音转文字
+  - 说话人识别
+  - 转发给 Agent
         |
         v
-HDZB_agent on port 8017
-  - LLM chat
-  - function calling tools
-  - weather
-  - intent detection
-  - in-memory conversation/profile data
+HDZB_agent，端口 8017
+  - LLM 对话
+  - Function Calling 工具调用
+  - 天气查询
+  - 意图识别
+  - 内存中的会话 / 用户画像数据
 ```
 
-## Evaluation and trace analysis
+## 评测与执行轨迹分析
 
-Every `/agent/chat` response now returns `metadata.trace_id`. Inspect recent
-executions at `GET /agent/traces`; a trace includes the selected tools, tool
-arguments, tool results, final response and end-to-end latency. This makes it
-possible to turn production failures into labelled evaluation examples.
+现在每次 `/agent/chat` 请求的返回结果中都会包含 `metadata.trace_id`。
 
-`evaluation/` contains `CompanionBench`, a transparent JSONL benchmark for
-tool selection, memory recall/conflict updates and safety. Score saved Agent
-outputs without performing hidden model calls:
+可以通过以下接口查看最近的执行记录：
+
+```text
+GET /agent/traces
+```
+
+每条执行轨迹包含：
+
+* Agent 选择了哪些工具
+* 工具调用参数
+* 工具调用结果
+* 最终生成的回复
+* 端到端执行延迟
+
+借助这些结构化执行信息，可以把实际运行过程中出现的失败案例整理成带标签的评测样本，用于后续定位问题和优化 Agent。
+
+`evaluation/` 目录中包含 `CompanionBench`，这是一个透明的 JSONL 格式评测基准，目前主要用于评估：
+
+* 工具选择能力
+* 长期记忆召回能力
+* 记忆冲突与更新能力
+* 安全性
+
+可以直接对已经保存的 Agent 输出进行评分，不会在评分过程中额外进行隐藏的模型调用：
 
 ```bash
 python evaluation/run_eval.py \
@@ -54,121 +68,170 @@ python evaluation/run_eval.py \
   --results evaluation/datasets/example_results.jsonl
 ```
 
-The generated report is written to `evaluation/reports/latest.json`. When
-comparing models or prompt/memory strategies, save each run's output separately
-and use this same scorer.
+生成的评测报告会保存到：
 
-## Local Setup
+```text
+evaluation/reports/latest.json
+```
 
-This project uses a dedicated Conda environment named `caremate` by default.
-The fastest way to prepare a text-only Agent environment is:
+在比较不同模型、Prompt 策略或记忆策略时，建议分别保存每次实验的输出，再统一使用该评分器进行评测，以保证实验结果可复现。
+
+## 本地环境配置
+
+项目默认使用名为 `caremate` 的独立 Conda 环境。
+
+最快的纯文本 Agent 环境配置方式为：
 
 ```bash
 ./scripts/setup_local.sh
 ```
 
-The script creates (or reuses) the `caremate` Conda environment, installs the
-Agent dependencies and creates
-`HDZB_agent/.env` from `.env.example` only if it does not already exist. Open
-that file and replace the two placeholder keys before starting the service.
-It does not install project packages into Conda's `base` environment.
+该脚本会：
 
-To use another name, set `CONDA_ENV_NAME` before running either script:
+* 创建或复用 `caremate` Conda 环境
+* 安装 Agent 所需依赖
+* 如果 `HDZB_agent/.env` 不存在，则基于 `.env.example` 自动创建
+* 不会覆盖已经存在的本地 `.env` 配置
+* 不会将项目依赖安装到 Conda 的 `base` 环境中
+
+启动服务之前，需要打开：
+
+```text
+HDZB_agent/.env
+```
+
+并将其中的两个占位 API Key 替换为自己的真实配置。
+
+如果希望使用其他 Conda 环境名称，可以在执行脚本前设置 `CONDA_ENV_NAME`：
 
 ```bash
 CONDA_ENV_NAME=my-agent ./scripts/setup_local.sh
 CONDA_ENV_NAME=my-agent ./scripts/start_agent.sh
 ```
 
-To also install the optional, heavier speech-recognition dependencies:
+如果还需要安装可选的、依赖较重的语音识别环境：
 
 ```bash
 ./scripts/setup_local.sh --with-asr
 ```
 
-On macOS, the ASR setup also installs FFmpeg into the same Conda environment;
-FunASR/TorchCodec needs its `libav*` libraries when decoding uploaded audio.
+在 macOS 上，ASR 安装流程还会在同一个 Conda 环境中安装 FFmpeg。FunASR 和 TorchCodec 在解码上传音频时需要使用相关的 `libav*` 动态库。
 
-Manual Conda setup is also supported:
+也可以手动创建 Conda 环境：
 
 ```bash
 conda create -n caremate python=3.11
 conda activate caremate
 ```
 
-Install the Agent service dependencies:
+安装 Agent 服务依赖：
 
 ```bash
 pip install -r HDZB_agent/requirements.txt
 ```
 
-Install the ASR service dependencies:
+安装 ASR 服务依赖：
 
 ```bash
 pip install -r HDZB_ASR/requirements.txt
 ```
 
-Copy environment variables and fill in your API keys. The ASR gateway reads the top-level `.env`; the Agent service reads `HDZB_agent/.env` (and falls back to the top-level `.env`). Never commit either file.
+复制环境变量文件并填写自己的 API Key。
+
+ASR 网关读取项目根目录下的 `.env`，Agent 服务优先读取 `HDZB_agent/.env`，如果不存在则回退到根目录 `.env`。
+
+请勿将这两个文件提交到 Git 仓库。
 
 ```bash
 cp .env.example .env
 cp .env.example HDZB_agent/.env
 ```
 
-## Run Locally
+## 本地运行
 
-Start only the text Agent first:
+建议首先只启动文本 Agent：
 
 ```bash
 ./scripts/start_agent.sh
 ```
 
-Then open `http://127.0.0.1:8017/docs`. The ASR gateway is optional; after
-installing with `--with-asr`, start it in a second terminal with:
+启动后打开：
+
+```text
+http://127.0.0.1:8017/docs
+```
+
+即可查看 Agent 的 FastAPI 接口文档。
+
+ASR 音频网关属于可选功能。在使用 `--with-asr` 完成环境安装后，可以打开第二个终端执行：
 
 ```bash
 ./scripts/start_asr.sh
 ```
 
-The local chat dashboard is served by the Agent itself:
+Agent 服务自身还提供了一个本地聊天网页：
 
-- `http://127.0.0.1:8017/app/`
+```text
+http://127.0.0.1:8017/app/
+```
 
-It talks directly to the validated text Agent API. When the Agent identifies
-a `SET_ALARM` intent, it persists a reminder in SQLite; the dashboard polls
-for due reminders and shows a browser notification while the page is open.
-This is a local web reminder, not an operating-system background alarm.
+该网页会直接调用已经验证过的文本 Agent API。
 
-The dashboard also supports opt-in browser geolocation. After clicking
-“使用当前位置” and granting permission, the browser sends coordinates to the
-local Agent, which uses Amap reverse geocoding to save the city/district for
-that session. The Agent can then use this saved location for weather and
-“是否适合出门” questions. Location is only stored in the local SQLite database.
+当 Agent 识别到 `SET_ALARM` 意图时，会将提醒信息持久化到 SQLite 数据库中。网页端会持续轮询已经到期的提醒，并在页面保持打开时显示浏览器通知。
 
-Manual commands:
+需要注意的是，目前实现的是**本地网页提醒**，并不是操作系统后台闹钟。因此网页关闭后，浏览器不会像系统闹钟一样在后台持续执行提醒。
 
-Start the Agent service:
+网页还支持用户主动授权浏览器地理位置。
+
+点击：
+
+```text
+使用当前位置
+```
+
+并授予权限后，浏览器会把经纬度发送给本地 Agent。
+
+Agent 使用高德地图逆地理编码获取当前城市和区县，并将其保存到当前会话中。之后 Agent 就可以根据保存的位置回答：
+
+* 当前天气怎么样
+* 今天是否适合出门
+* 本地天气相关问题
+
+位置信息只存储在本地 SQLite 数据库中。
+
+### 手动启动 Agent 服务
 
 ```bash
 cd HDZB_agent
 uvicorn main_agent:app --host "${SERVER_HOST:-0.0.0.0}" --port "${SERVER_PORT:-8017}" --reload
 ```
 
-Start the ASR gateway service in another terminal:
+### 手动启动 ASR 网关
+
+在另一个终端中执行：
 
 ```bash
 cd HDZB_ASR
 uvicorn main:app --host "${ASR_SERVER_HOST:-0.0.0.0}" --port "${ASR_SERVER_PORT:-8015}" --reload
 ```
 
-Open the service docs:
+### API 文档地址
 
-- Agent API: `http://localhost:8017/docs`
-- ASR gateway API: `http://localhost:8015/docs`
+Agent API：
 
-## Example Local Requests
+```text
+http://localhost:8017/docs
+```
 
-Direct Agent text chat:
+ASR 网关 API：
+
+```text
+http://localhost:8015/docs
+```
+
+## 本地请求示例
+
+### 直接进行 Agent 文本对话
 
 ```bash
 curl -X POST "http://localhost:8017/agent/chat" \
@@ -176,7 +239,7 @@ curl -X POST "http://localhost:8017/agent/chat" \
   -d '{"message":"你好，今天天气怎么样？","session_id":"local-device-001","agent_type":"companion","mode":"elder"}'
 ```
 
-Set a device's default companion mode:
+### 设置设备默认陪伴模式
 
 ```bash
 curl -X PUT "http://localhost:8017/agent/devices/local-device-001/mode" \
@@ -184,7 +247,7 @@ curl -X PUT "http://localhost:8017/agent/devices/local-device-001/mode" \
   -d '{"mode":"child"}'
 ```
 
-Set hardware-facing device configuration:
+### 设置面向硬件的设备配置
 
 ```bash
 curl -X PUT "http://localhost:8017/agent/devices/local-device-001/config" \
@@ -192,41 +255,34 @@ curl -X PUT "http://localhost:8017/agent/devices/local-device-001/config" \
   -d '{"volume":55,"light_profile":"soft","wake_method":"tap_head","usage_start":"08:00","usage_end":"21:30","content_policy":"需要家长知情后再处理定位和联系人信息"}'
 ```
 
-Mode resolution currently follows this order:
+当前陪伴模式的解析优先级如下：
 
-1. `mode` in the chat request.
-2. Device default mode from `/agent/devices/{device_id}/mode`.
-3. `elder` as the compatibility default.
+1. 聊天请求中显式传入的 `mode`
+2. `/agent/devices/{device_id}/mode` 中保存的设备默认模式
+3. 如果以上都没有，则默认使用 `elder`
 
-The resolved mode and device configuration are also passed into the Agent system prompt, so child and elder mode now have different response style and safety guidance while still sharing the same core capabilities.
+最终确定的模式以及设备配置也会被注入 Agent 的 System Prompt。
 
-ASR gateway audio chat:
+因此，儿童模式和老人模式可以共享相同的 Agent 核心能力，同时拥有不同的：
+
+* 回复风格
+* 交互策略
+* 安全约束
+* 内容边界
+
+### 通过 ASR 网关进行语音对话
 
 ```bash
 curl -X POST "http://localhost:8015/agent/chat" \
   -F "file=@HDZB_ASR/@user1@1.m4a"
 ```
 
-The current ASR gateway extracts a temporary device/session id from filenames such as `@user1@1.m4a`. A later hardware-oriented version should replace this with device registration and token-based authentication.
+当前 ASR 网关会从类似下面的文件名中临时提取设备 ID 或 Session ID：
 
-## Known Technical Debt
+```text
+@user1@1.m4a
+```
 
-- Conversation history and request traces are currently in-process and are lost after restart; structured family-member profiles persist in SQLite.
-- Device mode, device configuration, and family-member profiles are stored in SQLite through `SQLITE_DB_PATH`; conversation memory is still in process memory.
-- The Agent uses custom function-calling orchestration while some tool classes still inherit from LangChain `BaseTool`. This should be made consistent.
-- `main_agent.py` and `companion_agent.py` are too large and should be split into API, service, tool, prompt, and memory modules.
-- The ASR gateway still includes legacy companion-service routes on port `8016`.
-- TTS is not implemented yet, so the current cloud flow returns text rather than playable speech.
+后续面向真实硬件设备时，应该使用正式的设备注册机制和 Token 身份认证替代这种临时方案。
 
-## Recommended Optimization Order
 
-1. Local project hygiene: README, `.env.example`, `.gitignore`, dependency cleanup.
-2. Configuration cleanup: remove hard-coded paths and service URLs.
-3. API split: move request schemas and routers out of large entry files.
-4. Mode system: child and elder mode are represented as domain profiles, wired into the Agent system prompt, and device default mode is persisted in SQLite.
-5. Profile persistence: family-member profiles are persisted in SQLite.
-6. Device configuration: volume, light profile, wake method, usage window, and content policy are persisted in SQLite and injected into the Agent prompt. Next step is hardware response metadata.
-5. Memory persistence: add SQLite for structured profiles and Chroma for semantic memory.
-6. TTS and hardware response protocol: return text, audio URL, light actions, vibration actions, and metadata.
-7. Family web/admin panel: bind device, set mode, configure contacts, reminders, and usage rules.
-8. Tests: add pytest coverage for intent parsing, memory/profile services, tools, and API routes.
