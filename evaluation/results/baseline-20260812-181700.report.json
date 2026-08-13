@@ -1,0 +1,38 @@
+{
+  "dataset": "evaluation/datasets/family_memory_challenge_bench.jsonl",
+  "cases": 8,
+  "passed": 5,
+  "task_success_rate": 0.625,
+  "by_category": {
+    "challenge_entity_linking": 1.0,
+    "challenge_isolation": 1.0,
+    "challenge_multi_entity": 1.0,
+    "challenge_negation": 0.0,
+    "challenge_no_hallucination": 1.0,
+    "challenge_recency": 0.0,
+    "challenge_semantic_memory": 0.5
+  },
+  "failures": [
+    {
+      "id": "challenge-health-paraphrase-001",
+      "category": "challenge_semantic_memory",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 1
+    },
+    {
+      "id": "challenge-activity-negation-003",
+      "category": "challenge_negation",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 1
+    },
+    {
+      "id": "challenge-health-latest-event-004",
+      "category": "challenge_recency",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 1
+    }
+  ]
+}

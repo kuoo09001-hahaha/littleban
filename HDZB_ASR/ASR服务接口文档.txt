@@ -1,0 +1,191 @@
+=============================== AI服务接口文档 ===============================
+目录：
+1. 音频处理接口（audio_router.py）
+2. 关键字分析接口（keyword_router.py）
+3. 聊天交互接口（chat_router.py）
+4. 通用说明（参数/依赖/响应类型）
+
+===========================================================================
+一、音频处理接口（audio_router.py）
+核心能力：音频文件保存、语音识别、AMR转MP3、AMR直接转文本
+---------------------------------------------------------------------------
+1. 接口列表
+---------------------------------------------------------------------------
+接口路径          请求方法  功能描述
+/save-file        POST      接收任意文件并保存到配置的上传目录（SAVE_FILE_DIR）
+/transcribe       POST      音频转文本（语音识别）
+/convert          POST      AMR音频转MP3（可配置音频参数）
+/amr-to-text      POST      AMR音频直接转文本（先转MP3再做ASR）
+
+---------------------------------------------------------------------------
+2. 对应curl命令
+---------------------------------------------------------------------------
+# 1. 保存文件到桌面
+curl -X POST "http://localhost:8015/save-file" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+# 2. 音频转文本（语音识别）
+curl -X POST "http://localhost:8015/transcribe" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+# 3. AMR转MP3（默认参数）
+curl -X POST "http://localhost:8015/convert" -F "file=@C:\Users\DELL\Desktop\test.amr"
+
+# 4. AMR转MP3（自定义参数：声道/采样率/比特率）
+curl -X POST "http://localhost:8015/convert" -F "file=@C:\Users\DELL\Desktop\test.amr" -F "ac=2" -F "ar=16000" -F "bitrate=128k"
+
+# 5. AMR音频直接转文本
+curl -X POST "http://localhost:8015/amr-to-text" -F "file=@C:\Users\DELL\Desktop\test.amr"
+
+---------------------------------------------------------------------------
+3. 核心配置说明
+---------------------------------------------------------------------------
+- 文件保存路径：通过环境变量 SAVE_FILE_DIR 配置，默认 ./data/uploads
+- 依赖工具：FFmpeg（用于音频格式转换）
+- ASR模型：使用核心模块的语音识别模型
+- 音频参数默认值：
+  - 声道数（ac）：配置文件默认值
+  - 采样率（ar）：配置文件默认值
+  - 比特率（bitrate）：配置文件默认值
+
+===========================================================================
+二、关键字分析接口（keyword_router.py）
+核心能力：文本指令分析、获取支持的命令列表
+---------------------------------------------------------------------------
+1. 接口列表
+---------------------------------------------------------------------------
+接口路径              请求方法  功能描述
+/analyze-text         POST      文本指令分析（提取关键字、识别命令类型）
+/supported-commands   GET       获取支持的关键字/命令模板列表
+
+---------------------------------------------------------------------------
+2. 对应curl命令
+---------------------------------------------------------------------------
+# 1. 文本指令分析
+curl -X POST "http://localhost:8015/analyze-text" -H "Content-Type: application/json" -d "{\"text\":\"打开客厅灯，亮度调50%\"}"
+
+# 2. 获取支持的命令列表
+curl -X GET "http://localhost:8015/supported-commands"
+
+---------------------------------------------------------------------------
+3. 核心说明
+---------------------------------------------------------------------------
+- 依赖模块：core.keyword_utils（analyze_keywords、COMMAND_KEYWORDS、COMMAND_PATTERNS）
+- 响应格式：JSON，包含原文本+关键字分析结果/命令列表
+
+===========================================================================
+三、聊天交互接口（chat_router.py）
+核心能力：陪伴助手/智能Agent的语音/文本对话、设备会话管理、服务状态检查
+---------------------------------------------------------------------------
+1. 服务基础配置
+---------------------------------------------------------------------------
+- 陪伴助手服务：
+  名称：陪伴助手
+  非流式地址：{COMPANION_SERVICE_URL}/chat，默认 http://localhost:8016/chat
+  流式地址：{COMPANION_SERVICE_URL}/chat/stream，默认 http://localhost:8016/chat/stream
+- 智能Agent服务：
+  名称：智能Agent
+  非流式地址：{AGENT_SERVICE_URL}/agent/chat，默认 http://localhost:8017/agent/chat
+  健康检查地址：{AGENT_SERVICE_URL}/agent/health，默认 http://localhost:8017/agent/health
+
+---------------------------------------------------------------------------
+2. 接口列表（按功能分类）
+---------------------------------------------------------------------------
+【陪伴助手服务】
+接口路径                          请求方法  功能描述
+/companion/chat                   POST      陪伴助手语音对话（非流式）
+/companion/chat/stream            POST      陪伴助手语音对话（流式）
+/companion/direct_chat            POST      陪伴助手直接文本对话（无语音）
+/companion/device/{device_id}/history  GET   获取陪伴助手设备会话历史
+/companion/device/{device_id}/clear    DELETE 清理陪伴助手设备会话
+
+【智能Agent服务】
+接口路径                          请求方法  功能描述
+/agent/chat                       POST      智能Agent语音对话（非流式）
+/agent/audio_chat                 POST      智能Agent音频直接对话（音频不经过本地ASR）
+/agent/direct_chat                POST      智能Agent直接文本对话（无语音）
+/agent/device/{device_id}/history     GET   获取智能Agent设备会话历史
+/agent/device/{device_id}/clear       DELETE 清理智能Agent设备会话
+
+【服务状态&兼容接口】
+接口路径                          请求方法  功能描述
+/services/status                  GET       获取所有AI服务状态（陪伴助手/Agent/ASR）
+/chat_with_ai                     POST      兼容接口：语音对话（转发到陪伴助手，非流式）
+/chat_with_ai/stream              POST      兼容接口：流式语音对话（转发到陪伴助手）
+
+---------------------------------------------------------------------------
+3. 对应curl命令
+---------------------------------------------------------------------------
+【陪伴助手服务】
+# 1. 语音对话（非流式）
+curl -X POST "http://localhost:8015/companion/chat" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+# 2. 语音对话（流式）
+curl -X POST "http://localhost:8015/companion/chat/stream" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+# 3. 直接文本对话
+curl -X POST "http://localhost:8015/companion/direct_chat" -H "Content-Type: application/json" -d "{\"message\":\"你好，今天天气怎么样？\",\"session_id\":\"user1_device1\"}"
+
+# 4. 获取设备会话历史
+curl -X GET "http://localhost:8015/companion/device/user1_device1/history"
+
+# 5. 清理设备会话
+curl -X DELETE "http://localhost:8015/companion/device/user1_device1/clear"
+
+【智能Agent服务】
+# 1. 语音对话（非流式）
+curl -X POST "http://localhost:8015/agent/chat" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@2.m4a"
+
+
+# 2. 音频直接对话（音频不经过本地ASR）
+curl -X POST "http://localhost:8015/agent/audio_chat" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+# 3. 直接文本对话
+curl -X POST "http://localhost:8015/agent/direct_chat" -H "Content-Type: application/json" -d "{\"message\":\"查询今天的日程\",\"session_id\":\"user1_device1\"}"
+
+# 4. 获取设备会话历史
+curl -X GET "http://localhost:8015/agent/device/user1_device1/history"
+
+# 5. 清理设备会话
+curl -X DELETE "http://localhost:8015/agent/device/user1_device1/clear"
+
+【服务状态&兼容接口】
+# 1. 获取所有AI服务状态
+curl -X GET "http://localhost:8015/services/status"
+
+# 2. 兼容接口：语音对话（非流式）
+curl -X POST "http://localhost:8015/chat_with_ai" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+# 3. 兼容接口：流式语音对话
+curl -X POST "http://localhost:8015/chat_with_ai/stream" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+---------------------------------------------------------------------------
+4. 核心说明
+---------------------------------------------------------------------------
+- 设备ID提取：从上传文件的文件名中提取，作为session_id使用
+- ASR处理：所有语音对话接口先通过本地ASR模型识别文本，再调用后端服务
+- 流式响应：返回text/event-stream类型，逐段输出AI响应
+- 异常处理：所有接口均捕获异常，返回标准化HTTP状态码（400/500/502等）
+
+===========================================================================
+四、通用说明
+---------------------------------------------------------------------------
+1. 参数通用规则
+---------------------------------------------------------------------------
+- 文件上传接口：使用 -F "file=@文件路径" 传递文件，设备ID从文件名提取
+- JSON参数接口：使用 -H "Content-Type: application/json" + -d "{...}" 传递参数，需保证JSON格式合法
+- 路径参数：{device_id} 需替换为实际设备ID（如user1_device1）
+
+---------------------------------------------------------------------------
+2. 服务依赖
+---------------------------------------------------------------------------
+- 陪伴助手服务端口：8016
+- 智能Agent服务端口：8017
+- 本服务端口：8015
+- 依赖工具：FFmpeg（音频转换）、ASR模型（语音识别）
+- 接口超时时间：默认30秒
+
+---------------------------------------------------------------------------
+3. 响应类型
+---------------------------------------------------------------------------
+- 非流式接口：返回JSON格式响应（JSONResponse）
+- 流式对话接口：返回text/event-stream类型（StreamingResponse）
+- 音频转换接口：返回audio/mpeg类型（流式附件下载）

@@ -1,0 +1,24 @@
+{
+  "dataset": "evaluation/datasets/family_memory_challenge_bench.jsonl",
+  "cases": 8,
+  "passed": 7,
+  "task_success_rate": 0.875,
+  "by_category": {
+    "challenge_entity_linking": 1.0,
+    "challenge_isolation": 1.0,
+    "challenge_multi_entity": 1.0,
+    "challenge_negation": 1.0,
+    "challenge_no_hallucination": 1.0,
+    "challenge_recency": 0.0,
+    "challenge_semantic_memory": 1.0
+  },
+  "failures": [
+    {
+      "id": "challenge-health-latest-event-004",
+      "category": "challenge_recency",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 1
+    }
+  ]
+}

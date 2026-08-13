@@ -1,0 +1,32 @@
+pip install chromadb
+pip install tiktoken
+pip install langchain-community
+pip install langchain-core
+pip install -U langchain-openai
+pip install requests
+
+cd C:\Users\DELL\Desktop\HDZB_agent
+uvicorn main_agent:app --host localhost --port 8017 --reload
+
+index.html
+    │
+    ├─► 8015/transcribe  ──► ASR模型 (直接处理)
+    │
+    ├─► 8015/companion/*  ──► 转发到 8016 (陪伴助手)
+    │                           │
+    │                           └─► 简单的AI对话
+    │
+    └─► 8015/agent/*      ──► 转发到 8017 (智能Agent)
+                                │
+                                ├─► DeepSeek V3 (LLM)
+                                ├─► 天气查询 (高德API)
+                                ├─► 个人信息管理
+                                └─► 记忆管理
+
+
+curl -X POST "http://localhost:8015/agent/chat" -F "file=@C:\Users\DELL\Desktop\HDZB_ASR\@user1@1.m4a"
+
+curl -X POST "http://localhost:8017/agent/chat" -H "Content-Type: application/json" -d "{\"message\": \"关机\", \"session_id\": \"test-session-123\"}"
+
+curl -X POST "http://localhost:8017/agent/chat" -H "Content-Type: application/json" -d "{\"message\": \"今天有点难过\", \"session_id\": \"test-session-123\"}"
+curl -X POST "http://localhost:8017/agent/chat" -H "Content-Type: application/json" -d "{\"message\": \"北京今天天气怎么样\", \"session_id\": \"test-session-123\"}"

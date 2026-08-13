@@ -1,0 +1,35 @@
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets and editor files
+.env
+.DS_Store
+.vscode/
+.idea/
+*.lnk
+
+# Runtime data and generated assets
+data/
+HDZB_agent/data/
+HDZB_ASR/data/
+*.log
+
+# Audio samples and temporary media
+*.wav
+*.m4a
+*.mp3
+*.amr
+
+# Local documents exported during experiments
+*.docx
+

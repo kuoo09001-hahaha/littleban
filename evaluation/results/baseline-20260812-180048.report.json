@@ -1,0 +1,14 @@
+{
+  "dataset": "evaluation/datasets/family_memory_bench.jsonl",
+  "cases": 15,
+  "passed": 15,
+  "task_success_rate": 1.0,
+  "by_category": {
+    "family_activity_memory": 1.0,
+    "family_isolation": 1.0,
+    "family_long_memory": 1.0,
+    "family_profile": 1.0,
+    "multi_user_isolation": 1.0
+  },
+  "failures": []
+}

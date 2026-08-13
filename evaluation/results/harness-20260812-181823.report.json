@@ -1,0 +1,10 @@
+{
+  "dataset": "evaluation/datasets/harness_fault_injection_bench.jsonl",
+  "cases": 3,
+  "passed": 3,
+  "task_success_rate": 1.0,
+  "by_category": {
+    "fault_recovery": 1.0
+  },
+  "failures": []
+}

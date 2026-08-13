@@ -1,0 +1,3 @@
+{"id": "fault-retry-chat-001", "category": "fault_recovery", "session_id": "eval-fault-retry-chat-001-591e9513", "answer": "", "tool_calls": [], "error": "Injected transient transport failure (evaluation only)", "latency_ms": 0.0, "turns": []}
+{"id": "fault-retry-health-002", "category": "fault_recovery", "session_id": "eval-fault-retry-health-002-bb96270a", "answer": "", "tool_calls": [], "error": "Injected transient transport failure (evaluation only)", "latency_ms": 0.0, "turns": []}
+{"id": "fault-retry-reminder-003", "category": "fault_recovery", "session_id": "eval-fault-retry-reminder-003-f10b66a4", "answer": "", "tool_calls": [], "error": "Injected transient transport failure (evaluation only)", "latency_ms": 0.0, "turns": []}

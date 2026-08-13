@@ -1,0 +1,33 @@
+{
+  "dataset": "evaluation/datasets/family_memory_bench.jsonl",
+  "cases": 4,
+  "passed": 1,
+  "task_success_rate": 0.25,
+  "by_category": {
+    "family_long_memory": 0.0,
+    "multi_user_isolation": 1.0
+  },
+  "failures": [
+    {
+      "id": "family-health-cross-session-001",
+      "category": "family_long_memory",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 2
+    },
+    {
+      "id": "family-health-multiple-members-002",
+      "category": "family_long_memory",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 2
+    },
+    {
+      "id": "family-health-recall-by-grandchild-003",
+      "category": "family_long_memory",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 2
+    }
+  ]
+}

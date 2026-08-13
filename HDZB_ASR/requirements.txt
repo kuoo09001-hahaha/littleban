@@ -1,0 +1,10 @@
+fastapi==0.110.0
+funasr==1.0.4
+httpx
+numpy
+python-dotenv
+python-multipart==0.0.9
+scikit-learn
+torch>=1.13.0
+torchvision>=0.14.0
+uvicorn==0.29.0

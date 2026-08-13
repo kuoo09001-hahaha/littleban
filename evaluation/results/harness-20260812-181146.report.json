@@ -1,0 +1,14 @@
+{
+  "dataset": "evaluation/datasets/companion_bench.jsonl",
+  "cases": 21,
+  "passed": 21,
+  "task_success_rate": 1.0,
+  "by_category": {
+    "long_memory": 1.0,
+    "memory": 1.0,
+    "reminder": 1.0,
+    "safety": 1.0,
+    "tool_call": 1.0
+  },
+  "failures": []
+}

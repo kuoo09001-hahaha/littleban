@@ -1,0 +1,20 @@
+{
+  "dataset": "evaluation/datasets/family_memory_holdout_bench.jsonl",
+  "cases": 5,
+  "passed": 4,
+  "task_success_rate": 0.8,
+  "by_category": {
+    "holdout_activity_memory": 1.0,
+    "holdout_negation": 1.0,
+    "holdout_semantic_memory": 0.5
+  },
+  "failures": [
+    {
+      "id": "holdout-health-fever-002",
+      "category": "holdout_semantic_memory",
+      "passed": false,
+      "checks_passed": 0,
+      "checks_total": 1
+    }
+  ]
+}
