@@ -1,6 +1,8 @@
 # 小伴：可评测的长期记忆陪伴 Agent
 
 本仓库是一个支持语音交互的陪伴型 Agent 本地原型。
+<img width="2286" height="1442" alt="0d50de58-0ee0-46d2-889e-285ca4ec46f1" src="https://github.com/user-attachments/assets/112f435b-3250-490e-9e75-a44386841bcc" />
+
 
 当前代码库主要拆分为两个服务：
 
