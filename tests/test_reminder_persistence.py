@@ -11,6 +11,33 @@ if str(AGENT_ROOT) not in sys.path:
 
 
 class ReminderPersistenceTest(unittest.TestCase):
+    def test_all_reminder_types_are_idempotent_for_the_same_event(self):
+        from storage.sqlite_store import SQLiteStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "agent.db")
+            for repeat_rule, reminder_date in (("once", "2026-08-16"), ("daily", "2026-08-15"), ("weekdays", "2026-08-15")):
+                first, first_updated = store.upsert_reminder(
+                    "grandma-session", "吃药", "20:12", repeat_rule, reminder_date, "小明"
+                )
+                second, second_updated = store.upsert_reminder(
+                    "grandma-session", "吃药", "20:12", repeat_rule, reminder_date, "小明"
+                )
+                self.assertFalse(first_updated)
+                self.assertTrue(second_updated)
+                self.assertEqual(first["reminder_id"], second["reminder_id"])
+            self.assertEqual(len(store.list_reminders("grandma-session")), 3)
+
+    def test_different_date_or_time_is_a_different_event(self):
+        from storage.sqlite_store import SQLiteStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "agent.db")
+            store.upsert_reminder("s", "吃药", "20:12", "once", "2026-08-16", "小明")
+            store.upsert_reminder("s", "吃药", "20:13", "once", "2026-08-16", "小明")
+            store.upsert_reminder("s", "吃药", "20:12", "once", "2026-08-17", "小明")
+            self.assertEqual(len(store.list_reminders("s")), 3)
+
     def test_persists_and_completes_reminder(self):
         from storage.sqlite_store import SQLiteStore
 

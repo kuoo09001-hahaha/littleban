@@ -17,6 +17,14 @@ from services.prompt_builder import PromptBuilder
 
 logger = logging.getLogger("companion_agent")
 
+GENERIC_REMINDER_TITLES = {"", "提醒", "设置提醒", "通知", "闹钟", "记得"}
+
+
+def reminder_task_text(value: str | None) -> str:
+    """Use a natural placeholder when no concrete reminder task exists."""
+    text = str(value or "").strip()
+    return "这件事" if text in GENERIC_REMINDER_TITLES else text
+
 def clean_response(text: str) -> str:
     """
     清理回复内容，确保对老年人友好
@@ -62,7 +70,7 @@ def clean_response(text: str) -> str:
 class CompanionAgent(BaseElderlyAgent):
     """支持function calling的陪伴聊天Agent"""
 
-    def __init__(self, tools, memory, profile_service=None, prompt_builder=None):
+    def __init__(self, tools, memory, profile_service=None, prompt_builder=None, action_service=None):
         """
         初始化陪伴Agent
         
@@ -80,6 +88,7 @@ class CompanionAgent(BaseElderlyAgent):
         self.profile_service = profile_service
         self._family_personal_info = {}
         self.prompt_builder = prompt_builder or PromptBuilder()
+        self.action_service = action_service
         
         # 可用函数
         self.available_functions = self._build_available_functions()
@@ -100,19 +109,15 @@ class CompanionAgent(BaseElderlyAgent):
         return self._family_personal_info
 
     async def _execute_intent_analyzer_tool(self, args: Dict) -> str:
-        """执行意图识别工具"""
+        """Run only the deterministic fast path before the main LLM."""
         try:
             user_input = args.get("user_input", "")
-            
             intent_tool = self.tool_map.get("intent_analyzer")
             if intent_tool:
-                result = await intent_tool._arun(user_input)
-                return result
-            else:
-                return json.dumps({
-                    "intent_type": "NONE",
-                    "is_system_command": False
-                }, ensure_ascii=False)
+                local_intent = intent_tool._extract_local_reminder_intent(user_input)
+                if local_intent:
+                    return json.dumps(local_intent, ensure_ascii=False)
+            return json.dumps({"intent_type": "NONE", "is_system_command": False}, ensure_ascii=False)
                 
         except Exception as e:
             logger.error(f"意图识别工具执行失败: {str(e)}")
@@ -192,7 +197,7 @@ class CompanionAgent(BaseElderlyAgent):
 
                     if alarm_info.get("needs_time"):
                         repeat_text = "每天" if alarm_info.get("repeat_desc") == "daily" else ""
-                        name_str = alarm_info.get("name", "这件事")
+                        name_str = reminder_task_text(alarm_info.get("name"))
                         response_data["response"] = f"好的，我可以{repeat_text}提醒您{name_str}。请问要在几点提醒您？"
                         response_data["alarm_control"] = {"action": "needs_time", "alarm_info": alarm_info, "timestamp": datetime.now().isoformat()}
                         return response_data
@@ -206,7 +211,7 @@ class CompanionAgent(BaseElderlyAgent):
                     # 根据时间类型生成不同的响应
                     time_type = alarm_info.get("time_type", "absolute")
                     display_time = alarm_info.get("display_time", "08:00")
-                    name_str = alarm_info.get("name", "闹钟")
+                    name_str = reminder_task_text(alarm_info.get("name"))
                     repeat_desc = alarm_info.get("repeat_desc", "once")
                     
                     # 生成重复描述文本
@@ -214,9 +219,9 @@ class CompanionAgent(BaseElderlyAgent):
                     
                     if time_type == "relative":
                         minutes = alarm_info.get("minutes_from_now", 60)
-                        response_data["response"] = f"好的，{minutes}分钟后{repeat_text}提醒您{name_str}"
+                        response_data["response"] = f"好的，{minutes}分钟后{repeat_text}提醒您：{name_str}。"
                     else:
-                        response_data["response"] = f"好的，已设置{repeat_text}{display_time}的{name_str}"
+                        response_data["response"] = f"好的，已设置{repeat_text}{display_time}的提醒：{name_str}。"
                 
                 # 其他系统指令（关机、重启、呼叫等）
                 elif command_type in ["SYSTEM_SHUTDOWN", "SYSTEM_RESTART"]:
@@ -474,16 +479,25 @@ class CompanionAgent(BaseElderlyAgent):
             "add_personal_info": self._execute_add_personal_info_tool,
             "recall_personal_info": self._execute_recall_personal_info_tool,
             "list_family_members": self._execute_list_family_members_tool,
-            "intent_analyzer": self._execute_intent_analyzer_tool,
         }
         
         # 动态验证工具可用性
         available_functions = {}
         for func_name, func_method in function_map.items():
+            if self.action_service and func_name in {"add_personal_info", "recall_personal_info"}:
+                continue
             if (func_name in self.tool_map or 
-                func_name in ["add_personal_info", "recall_personal_info", "list_family_members", "intent_analyzer"]):
+                func_name in ["add_personal_info", "recall_personal_info", "list_family_members"]):
                 available_functions[func_name] = func_method
                 logger.info(f"注册可用函数: {func_name}")
+        if self.action_service:
+            for name in (
+                "set_reminder", "save_family_relationship", "query_family_relationship",
+                "record_health_event", "resolve_health_event", "query_health_events",
+                "save_preference", "query_preferences", "update_member_profile", "query_member_profile",
+            ):
+                available_functions[name] = None
+                logger.info(f"注册可用函数: {name}")
         
         return available_functions
         
@@ -537,7 +551,17 @@ class CompanionAgent(BaseElderlyAgent):
             tools = self._build_tools_description()
             
             # 调用聊天API（会自动包含历史）
-            result = await self._call_chat_api_with_tools(base_messages, tools, session_id)
+            result = await self._call_chat_api_with_tools(
+                base_messages,
+                tools,
+                session_id,
+                tool_context={
+                    "session_id": session_id,
+                    "family_id": kwargs.get("family_id", "default"),
+                    "actor_name": kwargs.get("actor_name"),
+                    "input_text": input_text,
+                },
+            )
             
             # 确保返回完整的结果
             if result and "success" in result:
@@ -655,6 +679,141 @@ class CompanionAgent(BaseElderlyAgent):
                     },
                     "required": ["query"]
                 }
+            },
+            "set_reminder": {
+                "name": "set_reminder",
+                "description": "为当前用户或其家庭成员创建提醒。用户表达提醒、到时通知、叫某人做某事时调用。请将不同说法归一成稳定的动作和对象。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "recipient_ref": {"type": "string", "description": "接收人：self、原话姓名或关系称呼，如奶奶"},
+                        "canonical_action": {"type": "string", "description": "规范动作，如服用、前往、联系、测量、出门"},
+                        "canonical_object": {"type": "string", "description": "动作对象，如降压药、知春路地铁站；没有则为空"},
+                        "task": {"type": "string", "description": "给用户展示的简短任务"},
+                        "date": {"type": "string", "description": "ISO日期YYYY-MM-DD"},
+                        "time": {"type": "string", "description": "24小时制HH:MM"},
+                        "repeat": {"type": "string", "enum": ["once", "daily", "weekdays", "weekend"], "description": "重复规则"}
+                    },
+                    "required": ["recipient_ref", "canonical_action", "canonical_object", "task", "date", "time", "repeat"]
+                }
+            },
+            "save_family_relationship": {
+                "name": "save_family_relationship",
+                "description": "仅当用户明确陈述家庭关系事实时记录。询问‘我奶奶是谁’绝不能调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "relation": {"type": "string", "enum": ["奶奶", "爷爷", "爸爸", "妈妈", "外婆", "外公", "孙子", "孙女", "儿子", "女儿", "老伴", "父母", "祖辈", "孩子", "孙辈"]},
+                        "target_name": {"type": "string", "description": "用户原话明确说出的姓名"},
+                        "target_age": {"type": "integer", "description": "明确提到的年龄；未提到时省略"}
+                    },
+                    "required": ["relation", "target_name"]
+                }
+            },
+            "query_family_relationship": {
+                "name": "query_family_relationship",
+                "description": "查询某个家庭关系对应的是谁，例如‘你认识我奶奶吗’。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"relation": {"type": "string", "enum": ["奶奶", "爷爷", "爸爸", "妈妈", "外婆", "外公", "孙子", "孙女", "儿子", "女儿", "老伴", "父母", "祖辈", "孩子", "孙辈"]}},
+                    "required": ["relation"]
+                }
+            },
+            "record_health_event": {
+                "name": "record_health_event",
+                "description": "用户明确描述自己或家人近期身体不适时，记录全部症状。不要扩展成医学诊断。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject_ref": {"type": "string", "description": "self、原话姓名或关系称呼"},
+                        "symptoms": {"type": "array", "items": {"type": "string"}, "description": "原话中的症状列表"}
+                    },
+                    "required": ["subject_ref", "symptoms"]
+                }
+            },
+            "query_health_events": {
+                "name": "query_health_events",
+                "description": "查询自己或家人近期的健康和不适记录。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject_ref": {"type": "string", "description": "self、原话姓名或关系称呼"},
+                        "days": {"type": "integer", "minimum": 1, "maximum": 30, "description": "查询最近多少天，默认7"}
+                    },
+                    "required": ["subject_ref", "days"]
+                }
+            },
+            "resolve_health_event": {
+                "name": "resolve_health_event",
+                "description": "用户明确表示自己或家人之前的近期症状已经缓解、消失或恢复时调用；保留历史但标记已恢复。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject_ref": {"type": "string", "description": "self、原话姓名或关系称呼"},
+                        "symptoms": {"type": "array", "items": {"type": "string"}, "description": "已经恢复的症状"}
+                    },
+                    "required": ["subject_ref", "symptoms"]
+                }
+            },
+            "save_preference": {
+                "name": "save_preference",
+                "description": "记录自己或家人明确、稳定的长期偏好。适用于爱吃、爱喝、平时喜欢、不喜欢等表达；临时的今天想吃或现在想玩不能记录。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject_ref": {"type": "string", "description": "self、原话姓名或关系称呼"},
+                        "category": {"type": "string", "enum": ["food", "activity", "entertainment", "habit", "other"]},
+                        "polarity": {"type": "string", "enum": ["like", "dislike"]},
+                        "item": {"type": "string", "description": "保留用户原话里的具体偏好对象，不要换成原话没有的词"}
+                    },
+                    "required": ["subject_ref", "category", "polarity", "item"]
+                }
+            },
+            "query_preferences": {
+                "name": "query_preferences",
+                "description": "查询自己或某位家人的长期偏好。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject_ref": {"type": "string", "description": "self、原话姓名或关系称呼"},
+                        "category": {"type": "string", "enum": ["food", "activity", "entertainment", "habit", "other"], "description": "明确限定类别时填写，否则省略"}
+                    },
+                    "required": ["subject_ref"]
+                }
+            },
+            "update_member_profile": {
+                "name": "update_member_profile",
+                "description": "更新自己或家人的当前年龄和长期健康情况。年龄使用覆盖更新；长期疾病或体质可新增，也可在用户明确表示已经治愈或不再患有时解除。不要用于短期头疼、头晕等近期症状。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject_ref": {"type": "string", "description": "self、原话姓名或关系称呼"},
+                        "age": {"type": "integer", "minimum": 0, "maximum": 130, "description": "明确说出的当前年龄；未提到则省略"},
+                        "health_changes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "condition": {"type": "string"},
+                                    "status": {"type": "string", "enum": ["active", "resolved"]}
+                                },
+                                "required": ["condition", "status"]
+                            }
+                        }
+                    },
+                    "required": ["subject_ref"]
+                }
+            },
+            "query_member_profile": {
+                "name": "query_member_profile",
+                "description": "查询自己或家人的当前年龄、长期健康情况和长期偏好，数据按家庭和成员隔离。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject_ref": {"type": "string", "description": "self、原话姓名或关系称呼"}
+                    },
+                    "required": ["subject_ref"]
+                }
             }
         }
         
@@ -670,7 +829,7 @@ class CompanionAgent(BaseElderlyAgent):
         logger.info(f"动态构建工具列表: {[tool['function']['name'] for tool in tools]}")
         return tools
     
-    async def _call_chat_api_with_tools(self, messages: List[Dict], tools: List[Dict], session_id: str) -> Dict[str, Any]:
+    async def _call_chat_api_with_tools(self, messages: List[Dict], tools: List[Dict], session_id: str, tool_context: Dict | None = None) -> Dict[str, Any]:
         """
         调用支持function calling的聊天API - 修复版本：包含对话历史
         """
@@ -710,7 +869,9 @@ class CompanionAgent(BaseElderlyAgent):
                     # 检查是否有tool calls
                     if "tool_calls" in message and message["tool_calls"]:
                         logger.info(f"检测到工具调用: {[tool_call['function']['name'] for tool_call in message['tool_calls']]}")
-                        return await self._handle_tool_calls(message, session_id, full_messages)
+                        return await self._handle_tool_calls(
+                            message, session_id, full_messages, tool_context or {}, tools, 2
+                        )
                     else:
                         # 直接返回AI回复
                         cleaned_response = clean_response(message["content"])
@@ -796,7 +957,15 @@ class CompanionAgent(BaseElderlyAgent):
         
         return full_messages
     
-    async def _handle_tool_calls(self, message: Dict, session_id: str, original_messages: List[Dict]) -> Dict[str, Any]:
+    async def _handle_tool_calls(
+        self,
+        message: Dict,
+        session_id: str,
+        original_messages: List[Dict],
+        tool_context: Dict | None = None,
+        tools: List[Dict] | None = None,
+        remaining_tool_rounds: int = 0,
+    ) -> Dict[str, Any]:
         """
         处理tool calls并执行相应工具
         
@@ -810,15 +979,42 @@ class CompanionAgent(BaseElderlyAgent):
         """
         tool_calls = message["tool_calls"]
         tool_results = []
-        
-        for tool_call in tool_calls:
+        action_results = []
+
+        # A model may emit independent-looking calls in either order. Stateful
+        # writes must be visible before dependent reads in the same turn, e.g.
+        # “王刚是我爸爸，你知道他几岁吗”.
+        write_tools = {
+            "save_family_relationship", "update_member_profile", "save_preference",
+            "record_health_event", "resolve_health_event", "set_reminder",
+        }
+        ordered_tool_calls = sorted(
+            enumerate(tool_calls),
+            key=lambda item: (0 if item[1]["function"]["name"] in write_tools else 1, item[0]),
+        )
+
+        for _, tool_call in ordered_tool_calls:
             tool_call_id = tool_call["id"]
             function_name = tool_call["function"]["name"]
             function_args = json.loads(tool_call["function"]["arguments"])
             
             logger.info(f"执行工具: {function_name}, 参数: {function_args}")
             
-            if function_name in self.available_functions:
+            if self.action_service and function_name in {
+                "set_reminder", "save_family_relationship", "query_family_relationship",
+                "record_health_event", "resolve_health_event", "query_health_events",
+                "save_preference", "query_preferences", "update_member_profile", "query_member_profile",
+            }:
+                execution = self.action_service.execute(function_name, function_args, tool_context or {})
+                result = execution.get("content", "工具执行完成")
+                action_results.append(execution)
+                tool_results.append({
+                    "tool_call_id": tool_call_id,
+                    "tool_name": function_name,
+                    "arguments": function_args,
+                    "result": result,
+                })
+            elif function_name in self.available_functions:
                 # 执行对应的工具函数
                 result = await self.available_functions[function_name](function_args)
                 tool_results.append({
@@ -836,16 +1032,132 @@ class CompanionAgent(BaseElderlyAgent):
                     "result": f"工具{function_name}暂不可用"
                 })
         
-        # 将工具结果返回给AI进行总结
-        final_response = await self._get_tool_final_response(original_messages, message, tool_results, session_id)
-        
-        return {
-            "success": True,
-            "response": final_response,
-            "session_id": session_id,
-            "tool_used": True,
-            "tool_results": tool_results
+        # If the normal Function Calling path discovers a system command,
+        # promote it to the same structured result used by the first-pass
+        # intent check.  Previously it was only shown to the LLM as text, so
+        # the assistant could say “已设置” without the reminder being stored.
+        promoted_command = self._promote_intent_tool_result(tool_results, session_id)
+        if promoted_command:
+            return promoted_command
+
+        if tools and remaining_tool_rounds > 0:
+            response = await self._continue_tool_conversation(
+                original_messages, message, tool_results, session_id,
+                tools, tool_context or {}, remaining_tool_rounds,
+            )
+            response["tool_results"] = tool_results + list(response.get("tool_results") or [])
+            response["tool_used"] = True
+        else:
+            # No more planning rounds: ask the model to express the actual
+            # tool result without exposing executable tools again.
+            final_response = await self._get_tool_final_response(original_messages, message, tool_results, session_id)
+            response = {
+                "success": True,
+                "response": final_response,
+                "session_id": session_id,
+                "tool_used": True,
+                "tool_results": tool_results
+            }
+        # The model writes the user-facing sentence, but executable state is
+        # always copied from the backend result.  This prevents a fluent final
+        # answer from becoming the source of truth for reminders or memory.
+        direct = next((item for item in reversed(action_results) if item.get("direct_response")), None)
+        if direct:
+            for key in (
+                "command_type", "alarm_control", "reminder", "reminder_persisted", "health_events",
+                "resolved_health_events", "preference", "preferences", "profile_updates",
+                "member_profile", "family_facts",
+            ):
+                if key in direct:
+                    response[key] = direct[key]
+        return response
+
+    async def _continue_tool_conversation(
+        self,
+        original_messages: List[Dict],
+        tool_message: Dict,
+        tool_results: List[Dict],
+        session_id: str,
+        tools: List[Dict],
+        tool_context: Dict,
+        remaining_tool_rounds: int,
+    ) -> Dict[str, Any]:
+        """Let the main model plan a dependent next tool call, up to a limit."""
+        messages = original_messages.copy()
+        messages.append(tool_message)
+        messages.extend(self._build_tool_result_messages(tool_results))
+        payload = {
+            "model": settings.ARK_MODEL_NAME,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "stream": False,
+            "max_tokens": settings.AGENT_MAX_TOKENS,
+            "temperature": settings.AGENT_TEMPERATURE,
         }
+        headers = {
+            "Authorization": f"Bearer {settings.ARK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                api_response = await client.post(settings.ARK_API_URL, headers=headers, json=payload, timeout=30.0)
+            if api_response.status_code != 200:
+                return {
+                    "success": True, "response": self._construct_fallback_response(tool_results),
+                    "session_id": session_id, "tool_used": True, "tool_results": [],
+                }
+            next_message = api_response.json()["choices"][0]["message"]
+            if next_message.get("tool_calls"):
+                return await self._handle_tool_calls(
+                    next_message, session_id, messages, tool_context,
+                    tools, remaining_tool_rounds - 1,
+                )
+            return {
+                "success": True,
+                "response": clean_response(next_message.get("content", "")),
+                "session_id": session_id,
+                "tool_used": True,
+                "tool_results": [],
+            }
+        except Exception as exc:
+            logger.error(f"继续多步工具调用失败: {exc}")
+            return {
+                "success": True, "response": self._construct_fallback_response(tool_results),
+                "session_id": session_id, "tool_used": True, "tool_results": [],
+            }
+
+    @staticmethod
+    def _promote_intent_tool_result(tool_results: List[Dict], session_id: str) -> Dict[str, Any] | None:
+        """Turn a fallback intent tool result into an executable command."""
+        for tool_result in tool_results:
+            if tool_result.get("tool_name") != "intent_analyzer":
+                continue
+            try:
+                intent_data = json.loads(tool_result.get("result", ""))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not intent_data.get("is_system_command") or intent_data.get("intent_type") != "SET_ALARM":
+                continue
+            alarm = intent_data.get("alarm_info") or {}
+            action = "needs_time" if alarm.get("needs_time") else "set"
+            repeat_text = "每天" if alarm.get("repeat_desc") == "daily" else ""
+            if action == "needs_time":
+                response = f"好的，我可以{repeat_text}提醒您{reminder_task_text(alarm.get('name'))}。请问要在几点提醒您？"
+            else:
+                response = f"好的，已设置{repeat_text}{alarm.get('display_time', '08:00')}的提醒：{reminder_task_text(alarm.get('name'))}。"
+            return {
+                "success": True,
+                "response": response,
+                "session_id": session_id,
+                "agent_type": "companion",
+                "is_system_command": True,
+                "command_type": "SET_ALARM",
+                "tool_used": True,
+                "tool_results": tool_results,
+                "alarm_control": {"action": action, "alarm_info": alarm, "timestamp": datetime.now().isoformat()},
+            }
+        return None
     
     def _build_tool_result_messages(self, tool_results: List[Dict]) -> List[Dict]:
         """Build OpenAI-compatible tool result messages."""
@@ -921,7 +1233,10 @@ class CompanionAgent(BaseElderlyAgent):
         if not tool_results:
             return "我已经尝试查询相关信息，但暂时无法获取完整结果。"
         
-        response_parts = ["我已经为您查询到以下信息："]
+        if len(tool_results) == 1:
+            return str(tool_results[0]["result"])
+
+        response_parts = ["已经处理了这些事情："]
         for result in tool_results:
             response_parts.append(f"\n{result['result']}")
         

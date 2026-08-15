@@ -51,8 +51,9 @@ from services.reminder_slot_service import (
     is_reminder_completion_query,
     reminder_title_hint,
 )
-from services.health_memory_service import extract_activity, extract_subject, extract_symptom, format_activity_events, format_events, inverse_relation, is_health_query, query_activity, query_subject, query_window_start
-from services.family_fact_service import extract_explicit_facts, extract_named_age, extract_named_relationship, format_persistent_context, normalize_person_name
+from services.health_memory_service import extract_activity, extract_subject, format_activity_events, query_activity, query_subject, query_window_start
+from services.family_fact_service import format_persistent_context, normalize_person_name
+from services.agent_action_service import AgentActionService
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -70,6 +71,7 @@ device_mode_service = DeviceModeService(store=sqlite_store)
 device_config_service = DeviceConfigService(sqlite_store)
 profile_service = ProfileService(sqlite_store)
 trace_store = TraceStore()
+agent_action_service = AgentActionService(sqlite_store)
 
 def get_companion_agent():
     """Return the initialized companion agent, if available."""
@@ -128,7 +130,10 @@ def setup_agents():
     ]
     
     # 创建陪伴Agent - 支持function calling版本
-    companion_agent = CompanionAgent(tools, conversation_memory, profile_service=profile_service)
+    companion_agent = CompanionAgent(
+        tools, conversation_memory, profile_service=profile_service,
+        action_service=agent_action_service,
+    )
     agents["companion"] = companion_agent
     
     logger.info("AI Agent初始化完成 - 已集成家庭成员个人信息管理")
@@ -136,7 +141,7 @@ def setup_agents():
     logger.info(f"高德API密钥状态: {'已配置' if settings.AMAP_API_KEY and settings.AMAP_API_KEY != '您的高德API密钥' else '未配置'}")
     logger.info(f"可用工具数量: {len(tools)}")
     logger.info(f"新增工具: 个人信息管理 (添加、查询、列出家庭成员)")
-    logger.info(f"新增工具: LLM意图识别")
+    logger.info("新增工具: 提醒、家庭关系与健康记忆 Function Calling")
 
 # 使用新的 lifespan 事件处理器替代已弃用的 on_event
 @contextlib.asynccontextmanager
@@ -266,20 +271,6 @@ async def agent_chat_endpoint(request: AgentRequest):
         pending_reminder = sqlite_store.get_pending_reminder(session_id)
         pending_time = extract_time(clean_message) if pending_reminder else None
         delete_reminder_request = bool(re.search(r"(?:删除|取消|关闭|不要|移除).{0,12}(?:提醒|闹钟|吃药|服药)", clean_message))
-        # First persist a relationship stated in this very message.  This
-        # allows “我奶奶是王秀芬…提醒她” to resolve the recipient immediately.
-        named_relationship = extract_named_relationship(clean_message)
-        named_age = extract_named_age(clean_message)
-        relationship_target = named_relationship[1] if named_relationship else None
-        if named_relationship and request.actor_name:
-            relation, target_name = named_relationship
-            target_age = named_age[1] if named_age and named_age[0] == target_name else None
-            sqlite_store.add_household_member(request.family_id, target_name, age=target_age)
-            sqlite_store.set_family_relationship(request.family_id, request.actor_name, target_name, relation)
-            inverse = inverse_relation(request.actor_name, relation)
-            if inverse:
-                sqlite_store.set_family_relationship(request.family_id, target_name, request.actor_name, inverse)
-
         household_members = sqlite_store.list_household_members(request.family_id)
         # Repair earlier records made before name parsing learned to remove
         # trailing age words, e.g. “王秀芬今年” -> “王秀芬”.
@@ -295,8 +286,6 @@ async def agent_chat_endpoint(request: AgentRequest):
         reminder_recipient = find_reminder_recipient(
             clean_message, request.actor_name, [member["member_name"] for member in household_members]
         )
-        if not reminder_recipient and relationship_target and re.search(r"(?:提醒|记得|闹钟).{0,10}(?:她|他)", clean_message):
-            reminder_recipient = relationship_target
         spoken_recipient_relation = next(
             (
                 relation for relation in ("奶奶", "爷爷", "爸爸", "妈妈", "外婆", "外公", "孙子", "孙女", "儿子", "女儿")
@@ -318,7 +307,6 @@ async def agent_chat_endpoint(request: AgentRequest):
             request.actor_name
             and re.search(r"(?:你知道|你记得)?\s*我(?:是|叫)?谁(?:吗|嘛)?[？?]?$", clean_message.strip())
         )
-        health_subject = (query_subject(clean_message) or named_member) if is_health_query(clean_message) else None
         status_recipient = named_member
         if reminder_completion_query and not status_recipient and request.actor_name:
             status_relation = next((item for item in ("奶奶", "爷爷", "爸爸", "妈妈", "外婆", "外公", "老伴", "孙子", "孙女", "儿子", "女儿") if item in clean_message), None)
@@ -326,24 +314,12 @@ async def agent_chat_endpoint(request: AgentRequest):
             status_recipient = related["member_name"] if related else None
         activity_subject = query_subject(clean_message) or named_member
         activity = query_activity(clean_message) if activity_subject else None
-        profile_subject = next((relation for relation in ("孙子", "孙女", "儿子", "女儿", "奶奶", "爷爷", "爸爸", "妈妈", "外婆", "外公", "老伴") if relation in clean_message), None)
-        relation_match = re.search(r"(.{1,32}?)是我的(孙子|孙女|儿子|女儿|奶奶|爷爷|爸爸|妈妈|外婆|外公|老伴)", clean_message)
-        if relation_match and request.actor_name:
-            target_name, relation = relation_match.groups()
-            target_name = normalize_person_name(target_name)
-            if sqlite_store.get_household_member(request.family_id, target_name):
-                sqlite_store.set_family_relationship(request.family_id, request.actor_name, target_name, relation)
-                inverse = inverse_relation(request.actor_name, relation)
-                if inverse:
-                    sqlite_store.set_family_relationship(request.family_id, target_name, request.actor_name, inverse)
-        for fact_key, fact_value in extract_explicit_facts(clean_message, request.actor_name):
-            sqlite_store.upsert_family_fact(request.family_id, request.actor_name, fact_key, fact_value, session_id)
         persistent_context = format_persistent_context(
             actor_profile,
             sqlite_store.list_member_relationships(request.family_id, request.actor_name) if request.actor_name else [],
             sqlite_store.list_family_facts(request.family_id, request.actor_name) if request.actor_name else [],
+            sqlite_store.list_family_relationship_graph(request.family_id) if request.actor_name else [],
         )
-        is_profile_query = profile_subject and any(word in clean_message for word in ("信息", "多大", "几岁", "叫什么", "名字", "年龄"))
         if identity_query:
             age_text = f"，今年{actor_profile['age']}岁" if actor_profile and actor_profile.get("age") is not None else ""
             result = {
@@ -375,9 +351,13 @@ async def agent_chat_endpoint(request: AgentRequest):
                 reminder = reminders[0]
                 date_text = format_reminder_date(requested_date)
                 setter = f"，是{reminder['created_by']}帮您设的" if reminder.get("created_by") else ""
+                if reminder["title"] in {"", "提醒", "设置提醒", "通知", "闹钟", "记得"}:
+                    recall_text = f"您在{date_text}{reminder['reminder_time']}有一项提醒{setter}。"
+                else:
+                    recall_text = f"您在{date_text}{reminder['reminder_time']}要{reminder['title']}{setter}。"
                 result = {
                     "success": True,
-                    "response": f"您{date_text}{reminder['reminder_time']}要{reminder['title']}{setter}。",
+                    "response": recall_text,
                     "session_id": session_id, "agent_type": agent_type, "tool_used": False, "tool_results": [],
                     "reminder": reminder,
                 }
@@ -396,27 +376,6 @@ async def agent_chat_endpoint(request: AgentRequest):
                 "session_id": session_id, "agent_type": agent_type, "command_type": "DELETE_ALARM",
                 "tool_used": False, "tool_results": [], "deleted_reminders": deleted,
             }
-        elif is_profile_query:
-            member = sqlite_store.find_related_member(request.family_id, request.actor_name, profile_subject) if request.actor_name else None
-            if member:
-                age_text = f"，今年{member['age']}岁" if member.get("age") is not None else ""
-                result = {
-                    "success": True, "response": f"您{profile_subject}叫{member['member_name']}{age_text}。",
-                    "session_id": session_id, "agent_type": agent_type, "tool_used": False, "tool_results": [],
-                    "family_profile": member,
-                }
-            else:
-                result = {
-                    "success": True, "response": f"我还不知道您和{profile_subject}对应的是哪位家人。可以先说“某某是我的{profile_subject}”。",
-                    "session_id": session_id, "agent_type": agent_type, "tool_used": False, "tool_results": [],
-                }
-        elif health_subject:
-            events = sqlite_store.find_recent_health_events(request.family_id, health_subject, query_window_start(clean_message).isoformat())
-            result = {
-                "success": True, "response": format_events(health_subject, events), "session_id": session_id,
-                "agent_type": agent_type, "tool_used": False, "tool_results": [],
-                "health_memory": {"family_id": request.family_id, "person_name": health_subject, "event_count": len(events)},
-            }
         elif activity_subject and activity:
             events = sqlite_store.find_recent_activity_events(request.family_id, activity_subject, activity, query_window_start(clean_message).isoformat())
             result = {
@@ -426,27 +385,34 @@ async def agent_chat_endpoint(request: AgentRequest):
             }
         elif pending_reminder and pending_time:
             reminder_date = pending_reminder.get("reminder_date") or datetime.now().date().isoformat()
-            reminder, updated = sqlite_store.upsert_reminder(
-                session_id=pending_reminder.get("recipient_session_id") or session_id,
-                title=pending_reminder["title"],
-                reminder_time=pending_time,
-                repeat_rule=pending_reminder["repeat_rule"],
-                reminder_date=reminder_date,
-                created_by=pending_reminder.get("created_by") or request.actor_name,
-            )
+            pending_recipient_session = pending_reminder.get("recipient_session_id")
+            if pending_recipient_session:
+                reminder_recipient = next(
+                    (
+                        member["member_name"] for member in household_members
+                        if sqlite_store.member_session_id(request.family_id, member["member_name"]) == pending_recipient_session
+                    ),
+                    None,
+                )
+                recipient_session_id = pending_recipient_session
             sqlite_store.clear_pending_reminder(session_id)
-            repeat_text = "每天" if reminder["repeat_rule"] == "daily" else ""
-            date_text = "" if reminder["repeat_rule"] == "daily" else f"{format_reminder_date(reminder_date)}"
             result = {
                 "success": True,
-                "response": f"好的，已{'更新' if updated else '设置'}{date_text}{repeat_text}{pending_time}的{reminder['title']}。",
+                "response": "正在保存提醒。",
                 "session_id": session_id,
                 "agent_type": agent_type,
                 "command_type": "SET_ALARM",
                 "tool_used": False,
                 "tool_results": [],
-                "alarm_control": {"action": "set", "alarm_info": {"name": reminder["title"], "display_time": pending_time, "repeat_desc": reminder["repeat_rule"]}},
-                "reminder": reminder,
+                "alarm_control": {
+                    "action": "set",
+                    "alarm_info": {
+                        "name": pending_reminder["title"],
+                        "display_time": pending_time,
+                        "date_value": reminder_date.replace("-", ""),
+                        "repeat_desc": pending_reminder["repeat_rule"],
+                    },
+                },
             }
         else:
 
@@ -458,17 +424,32 @@ async def agent_chat_endpoint(request: AgentRequest):
                 device_config=device_config,
                 session_location=location["location_name"] if location else None,
                 actor_name=request.actor_name,
+                family_id=request.family_id,
                 persistent_context=persistent_context,
             )
 
-        # Persist an explicit symptom statement independently of short-term
-        # chat history, so an authorised family member can retrieve it later.
-        symptom = extract_symptom(clean_message)
-        subject = extract_subject(clean_message, request.actor_name)
-        if symptom and subject and not health_subject:
-            result["health_event"] = sqlite_store.add_health_event(
-                family_id=request.family_id, person_name=subject, symptom=symptom, session_id=session_id,
+        # The first-pass rules and the fallback LLM now produce the same
+        # SET_ALARM contract. Once that intent is confirmed, resolve a named
+        # member or spoken family relation without requiring a particular
+        # reminder verb such as “提醒”.
+        if result.get("command_type") == "SET_ALARM" and not reminder_recipient:
+            reminder_recipient = named_member
+            if not reminder_recipient and request.actor_name:
+                recipient_relation = next(
+                    (relation for relation in ("奶奶", "爷爷", "爸爸", "妈妈", "外婆", "外公", "老伴", "孙子", "孙女", "儿子", "女儿") if relation in clean_message),
+                    None,
+                )
+                related_member = (
+                    sqlite_store.find_member_by_spoken_relation(request.family_id, request.actor_name, recipient_relation)
+                    if recipient_relation else None
+                )
+                reminder_recipient = related_member["member_name"] if related_member else None
+            recipient_session_id = (
+                sqlite_store.member_session_id(request.family_id, reminder_recipient)
+                if reminder_recipient else session_id
             )
+
+        subject = extract_subject(clean_message, request.actor_name)
         activity_statement = extract_activity(clean_message)
         if activity_statement and subject and not activity:
             result["activity_event"] = sqlite_store.add_activity_event(
@@ -486,25 +467,44 @@ async def agent_chat_endpoint(request: AgentRequest):
                 created_by=request.actor_name if reminder_recipient else None,
             )
 
-        if result.get("command_type") == "SET_ALARM" and result.get("alarm_control", {}).get("action") == "set":
+        if (result.get("command_type") == "SET_ALARM"
+                and result.get("alarm_control", {}).get("action") == "set"
+                and not result.get("reminder_persisted")):
             alarm = result.get("alarm_control", {}).get("alarm_info", {})
+            # Date and time are deterministic slots. Prefer values parsed from
+            # the original request to an LLM-invented calendar date.
+            parsed_time = extract_time(clean_message)
+            if parsed_time:
+                alarm["display_time"] = parsed_time
+                alarm["time_value"] = parsed_time.replace(":", "")
+            parsed_date = extract_reminder_date(clean_message)
+            alarm["date_value"] = parsed_date.replace("-", "")
+            alarm["display_date"] = parsed_date
             extracted_task = extract_reminder_task(clean_message, request.actor_name)
             if extracted_task:
                 alarm["name"] = extracted_task
-            reminder_date = alarm_date_to_iso(alarm)
-            reminder, updated = sqlite_store.upsert_reminder(
-                session_id=recipient_session_id,
-                title=alarm.get("name", "提醒"),
-                reminder_time=str(alarm.get("display_time", "08:00")),
-                repeat_rule=alarm.get("repeat_desc", "once"),
-                reminder_date=reminder_date,
-                created_by=request.actor_name if reminder_recipient else None,
+            execution = agent_action_service.execute(
+                "set_reminder",
+                {
+                    "recipient_ref": reminder_recipient or "self",
+                    "canonical_action": alarm.get("name", "提醒"),
+                    "canonical_object": "",
+                    "task": alarm.get("name", "提醒"),
+                    "date": alarm_date_to_iso(alarm),
+                    "time": str(alarm.get("display_time", "08:00")),
+                    "repeat": alarm.get("repeat_desc", "once"),
+                },
+                {
+                    "session_id": session_id,
+                    "family_id": request.family_id,
+                    "actor_name": request.actor_name,
+                    "input_text": clean_message,
+                },
             )
-            result.setdefault("reminder", reminder)
-            repeat_text = "每天" if reminder["repeat_rule"] == "daily" else ""
-            date_text = "" if reminder["repeat_rule"] == "daily" else format_reminder_date(reminder_date)
-            recipient_text = f"给{reminder_recipient}" if reminder_recipient else ""
-            result["response"] = f"好的，已{'更新' if updated else '设置'}{recipient_text}{date_text}{repeat_text}{reminder['reminder_time']}的{reminder['title']}。"
+            result["response"] = execution.get("direct_response", execution.get("content", result["response"]))
+            for key in ("command_type", "alarm_control", "reminder", "reminder_persisted"):
+                if key in execution:
+                    result[key] = execution[key]
         
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
@@ -544,6 +544,10 @@ async def agent_chat_endpoint(request: AgentRequest):
         if "command_type" in result:
             response_data["command_type"] = result["command_type"]
             logger.info(f"包含系统指令类型: {result['command_type']}")
+        if result.get("alarm_control") is not None:
+            response_data["alarm_control"] = result["alarm_control"]
+        if result.get("reminder") is not None:
+            response_data["reminder"] = result["reminder"]
         
         return AgentResponse(**response_data)
         

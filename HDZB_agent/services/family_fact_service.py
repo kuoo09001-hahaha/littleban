@@ -4,7 +4,10 @@ import re
 
 
 RELATIONS = ("奶奶", "爷爷", "爸爸", "妈妈", "外婆", "外公", "孙子", "孙女", "儿子", "女儿", "老伴")
-LONG_TERM_CONDITIONS = ("高血压", "糖尿病", "哮喘", "冠心病", "关节炎", "花粉过敏", "药物过敏")
+PREFERENCE_CATEGORY_LABELS = {
+    "food": "饮食", "activity": "活动", "entertainment": "娱乐",
+    "habit": "生活习惯", "other": "其他",
+}
 
 
 def normalize_person_name(value: str) -> str:
@@ -17,9 +20,19 @@ def normalize_person_name(value: str) -> str:
 
 def extract_named_relationship(text: str) -> tuple[str, str] | None:
     """Extract phrases such as '我爷爷叫王刚' for the current speaker."""
+    # Relationship memory must only be written from an explicit declaration.
+    # “我奶奶是谁吗/我奶奶是王秀芬吗” are questions, not facts.  The old
+    # regex consumed “谁吗” as a Chinese name and polluted the family graph.
+    if re.search(r"[？?]", text) or re.search(r"(?:谁|哪位|什么名字)", text) or re.search(r"(?:吗|嘛|呢)\s*$", text):
+        return None
     relation_pattern = "|".join(RELATIONS)
     match = re.search(rf"我(?:的)?({relation_pattern})(?:叫|是)([\u4e00-\u9fff]{{2,8}})(?:(?:今年|现年)?(?:\d{{1,3}}|[零一二两三四五六七八九十]+)岁)?", text)
-    return (match.group(1), normalize_person_name(match.group(2))) if match else None
+    if not match:
+        return None
+    target_name = normalize_person_name(match.group(2))
+    if target_name in {"谁", "谁吗", "哪位", "什么", "什么名字"}:
+        return None
+    return match.group(1), target_name
 
 
 def extract_named_age(text: str) -> tuple[str, int] | None:
@@ -36,32 +49,35 @@ def extract_named_age(text: str) -> tuple[str, int] | None:
     return normalize_person_name(match.group(1)), int(match.group(2))
 
 
-def extract_explicit_facts(text: str, actor_name: str | None) -> list[tuple[str, str]]:
-    """Return only deliberate long-term facts stated about the current speaker."""
-    if not actor_name:
-        return []
-    facts: list[tuple[str, str]] = []
-    for key, pattern in (
-        ("喜欢", r"我(?:很)?喜欢([^，。！？!?]{1,24})"),
-        ("不喜欢", r"我(?:很)?不喜欢([^，。！？!?]{1,24})"),
-        ("过敏", r"我(?:对)?([^，。！？!?]{1,24})过敏"),
-    ):
-        match = re.search(pattern, text)
-        if match:
-            value = match.group(1).strip()
-            if value:
-                facts.append((key, value))
-    for condition in LONG_TERM_CONDITIONS:
-        if re.search(rf"我(?:患有|有){condition}", text):
-            facts.append(("长期健康情况", condition))
-    return facts
-
-
-def format_persistent_context(profile: dict | None, relationships: list[dict], facts: list[dict]) -> str:
+def format_persistent_context(
+    profile: dict | None,
+    relationships: list[dict],
+    facts: list[dict],
+    family_graph: list[dict] | None = None,
+) -> str:
     """Compact, model-facing summary; it deliberately excludes raw chat history."""
     items: list[str] = []
     if profile and profile.get("age") is not None:
         items.append(f"年龄：{profile['age']}岁")
     items.extend(f"{item['relation']}：{item['target_name']}" for item in relationships)
-    items.extend(f"{item['fact_key']}：{item['fact_value']}" for item in facts)
+    graph_items: list[str] = []
+    for edge in (family_graph or [])[:40]:
+        source = edge.get("source_name")
+        target = edge.get("target_name")
+        relation = edge.get("relation")
+        if not source or not target or not relation:
+            continue
+        provenance = "明确" if edge.get("edge_type") == "direct" else "安全推导"
+        graph_items.append(f"{source}的{relation}是{target}（{provenance}）")
+    if graph_items:
+        items.append("家庭关系图：" + "、".join(graph_items))
+    for item in facts:
+        key, value = item["fact_key"], item["fact_value"]
+        if key.startswith("偏好:") and ":" in value:
+            category = key.split(":", 1)[1]
+            polarity, preference = value.split(":", 1)
+            category_text = PREFERENCE_CATEGORY_LABELS.get(category, category)
+            items.append(f"{category_text}偏好：{'喜欢' if polarity == 'like' else '不喜欢'}{preference}")
+        else:
+            items.append(f"{key}：{value}")
     return "；".join(items) if items else "暂无已确认的长期重点信息"

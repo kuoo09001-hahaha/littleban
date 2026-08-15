@@ -54,10 +54,22 @@ def inverse_relation(source_name: str, relation: str) -> str | None:
 
 
 def extract_symptom(text: str) -> str | None:
-    for normalized, aliases in SYMPTOM_ALIASES.items():
-        if any(re.search(alias, text) for alias in aliases):
-            return normalized
-    return None
+    symptoms = extract_symptoms(text)
+    return symptoms[0] if symptoms else None
+
+
+def extract_symptoms(text: str) -> list[str]:
+    """Return every mentioned symptom, in a stable order.
+
+    One sentence may contain several useful health signals (for example,
+    “血压有点高，头晕”).  Storing just the first match loses information
+    needed by family members later.
+    """
+    return [
+        normalized
+        for normalized, aliases in SYMPTOM_ALIASES.items()
+        if any(re.search(alias, text) for alias in aliases)
+    ]
 
 
 def extract_subject(text: str, actor_name: str | None) -> str | None:
@@ -89,10 +101,6 @@ def is_negated_activity_statement(text: str) -> bool:
     return False
 
 
-def is_health_query(text: str) -> bool:
-    return any(phrase in text for phrase in ("有没有说", "哪里不舒服", "最近不舒服", "最近怎么样", "身体怎么样"))
-
-
 def query_subject(text: str) -> str | None:
     return next((name for name in RELATIONS if name in text), None)
 
@@ -121,11 +129,32 @@ def query_window_start(text: str) -> datetime:
 def format_events(person_name: str, events: list[dict]) -> str:
     if not events:
         return f"最近没有记录到{person_name}说身体不舒服。"
-    newest = events[0]
-    happened = datetime.fromisoformat(newest["occurred_at"])
-    days_ago = (datetime.now().date() - happened.date()).days
-    when = "今天" if days_ago == 0 else ("昨天" if days_ago == 1 else f"{days_ago}天前")
-    return f"{person_name}{when}提到过{newest['symptom']}。这是健康情况记录，若症状持续或加重，建议尽快联系家人或医生。"
+    def event_time_text(occurred_at: str) -> str:
+        happened = datetime.fromisoformat(occurred_at)
+        days_ago = (datetime.now().date() - happened.date()).days
+        day_text = "今天" if days_ago == 0 else ("昨天" if days_ago == 1 else f"{days_ago}天前")
+        hour = happened.hour
+        period = (
+            "凌晨" if hour < 5 else "上午" if hour < 12 else "中午" if hour < 14
+            else "下午" if hour < 18 else "晚上"
+        )
+        return f"{day_text}{period}{happened.strftime('%H:%M')}"
+
+    # Keep the answer readable while retaining the time of each distinct
+    # event; a merged symptom list loses the useful “when” information.
+    records = []
+    seen = set()
+    for event in events:
+        key = (event["symptom"], event["occurred_at"], event.get("resolved_at"))
+        if key not in seen:
+            seen.add(key)
+            record = f"{event_time_text(event['occurred_at'])}提到过{event['symptom']}"
+            if event.get("resolved_at"):
+                record += f"，{event_time_text(event['resolved_at'])}表示已经好了"
+            records.append(record)
+        if len(records) == 4:
+            break
+    return f"{person_name}{'；'.join(records)}。这是健康情况记录，若症状持续或加重，建议尽快联系家人或医生。"
 
 
 def format_activity_events(person_name: str, activity: str, events: list[dict]) -> str:
@@ -135,4 +164,3 @@ def format_activity_events(person_name: str, activity: str, events: list[dict]) 
     days_ago = (datetime.now().date() - happened.date()).days
     when = "今天" if days_ago == 0 else ("昨天" if days_ago == 1 else f"{days_ago}天前")
     return f"有记录：{person_name}{when}说过自己去{activity}了。"
-

@@ -9,6 +9,18 @@ from typing import Optional
 from urllib.parse import quote
 
 
+RELATION_GENDER = {
+    "爸爸": "male", "爷爷": "male", "外公": "male", "儿子": "male", "孙子": "male",
+    "妈妈": "female", "奶奶": "female", "外婆": "female", "女儿": "female", "孙女": "female",
+}
+NEUTRAL_RELATIONS = {
+    "爸爸": "父母", "妈妈": "父母",
+    "爷爷": "祖辈", "奶奶": "祖辈", "外公": "祖辈", "外婆": "祖辈",
+    "儿子": "孩子", "女儿": "孩子",
+    "孙子": "孙辈", "孙女": "孙辈",
+}
+
+
 class SQLiteStore:
     """Small SQLite store for local device configuration."""
 
@@ -16,6 +28,7 @@ class SQLiteStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
+        self.rebuild_all_family_graphs()
 
     @contextmanager
     def _connect(self):
@@ -153,6 +166,7 @@ class SQLiteStore:
                     member_name TEXT NOT NULL,
                     relationship TEXT NOT NULL DEFAULT '',
                     age INTEGER,
+                    gender TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (family_id, member_name)
                 )
@@ -165,6 +179,8 @@ class SQLiteStore:
                     source_name TEXT NOT NULL,
                     target_name TEXT NOT NULL,
                     relation TEXT NOT NULL,
+                    edge_type TEXT NOT NULL DEFAULT 'direct',
+                    evidence TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (family_id, source_name, target_name, relation)
                 )
@@ -190,6 +206,36 @@ class SQLiteStore:
                 conn.execute("ALTER TABLE household_members ADD COLUMN relationship TEXT NOT NULL DEFAULT ''")
             if "age" not in household_columns:
                 conn.execute("ALTER TABLE household_members ADD COLUMN age INTEGER")
+            if "gender" not in household_columns:
+                conn.execute("ALTER TABLE household_members ADD COLUMN gender TEXT NOT NULL DEFAULT ''")
+            relationship_columns = {row[1] for row in conn.execute("PRAGMA table_info(family_relationships)")}
+            if "edge_type" not in relationship_columns:
+                conn.execute("ALTER TABLE family_relationships ADD COLUMN edge_type TEXT NOT NULL DEFAULT 'direct'")
+            if "evidence" not in relationship_columns:
+                conn.execute("ALTER TABLE family_relationships ADD COLUMN evidence TEXT NOT NULL DEFAULT ''")
+            # Older releases eagerly wrote a guessed reverse row (for example
+            # 小明→王刚=爸爸 together with 王刚→小明=儿子).  Those rows have no
+            # provenance, so migrate only the mechanically paired, near-
+            # simultaneous reverse rows to derived edges.  The graph rebuild
+            # below will recreate them from the direct statement with evidence.
+            conn.execute(
+                """UPDATE family_relationships AS reverse
+                SET edge_type = 'derived', evidence = '旧版自动反向关系迁移'
+                WHERE reverse.edge_type = 'direct' AND reverse.evidence = ''
+                  AND reverse.relation IN ('儿子', '女儿', '孙子', '孙女')
+                  AND EXISTS (
+                    SELECT 1 FROM family_relationships AS forward
+                    WHERE forward.family_id = reverse.family_id
+                      AND forward.source_name = reverse.target_name
+                      AND forward.target_name = reverse.source_name
+                      AND (
+                        (reverse.relation IN ('儿子', '女儿') AND forward.relation IN ('爸爸', '妈妈'))
+                        OR
+                        (reverse.relation IN ('孙子', '孙女') AND forward.relation IN ('爷爷', '奶奶', '外公', '外婆'))
+                      )
+                      AND ABS((julianday(forward.updated_at) - julianday(reverse.updated_at)) * 86400.0) <= 10
+                  )"""
+            )
             for table, retention in (("health_events", 30), ("activity_events", 4 / 24)):
                 columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                 if "expires_at" not in columns:
@@ -198,6 +244,9 @@ class SQLiteStore:
                     for event_id, created_at in rows:
                         expiry = datetime.fromisoformat(created_at) + timedelta(days=retention)
                         conn.execute(f"UPDATE {table} SET expires_at = ? WHERE event_id = ?", (expiry.isoformat(), event_id))
+            health_columns = {row[1] for row in conn.execute("PRAGMA table_info(health_events)")}
+            if "resolved_at" not in health_columns:
+                conn.execute("ALTER TABLE health_events ADD COLUMN resolved_at TEXT")
             self._purge_expired_events(conn)
 
     @staticmethod
@@ -364,14 +413,39 @@ class SQLiteStore:
         return reminder
 
     def upsert_reminder(self, session_id: str, title: str, reminder_time: str, repeat_rule: str = "once", reminder_date: str | None = None, created_by: str | None = None) -> tuple[dict, bool]:
-        """Create a reminder or update the only existing daily reminder.
+        """Idempotently create or update a reminder event.
 
-        A short correction such as “每天中午提醒” has no task name; retaining
-        the existing daily title avoids creating a duplicate reminder.
+        The same recipient, task, time, date and repeat rule identify one
+        logical event for every reminder type. ``BEGIN IMMEDIATE`` serialises
+        concurrent writers so duplicate HTTP requests cannot both insert it.
+        A short daily correction still updates the only active daily reminder.
         """
-        if repeat_rule != "daily":
-            return self.create_reminder(session_id, title, reminder_time, repeat_rule, reminder_date, created_by), False
+        title = title.strip() or "提醒"
+        reminder_time = reminder_time.strip()
+        repeat_rule = repeat_rule.strip() or "once"
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            keys = ("reminder_id", "session_id", "title", "reminder_time", "repeat_rule", "reminder_date", "created_at", "completed_at", "last_triggered_date", "last_completed_date", "created_by")
+            exact = conn.execute(
+                """SELECT reminder_id, session_id, title, reminder_time, repeat_rule, reminder_date,
+                          created_at, completed_at, last_triggered_date, last_completed_date, created_by
+                   FROM reminders
+                   WHERE session_id = ? AND title = ? AND reminder_time = ? AND repeat_rule = ?
+                     AND COALESCE(reminder_date, '') = COALESCE(?, '')
+                   ORDER BY created_at LIMIT 1""",
+                (session_id, title, reminder_time, repeat_rule, reminder_date),
+            ).fetchone()
+            if exact:
+                return dict(zip(keys, exact)), True
+
+            if repeat_rule != "daily":
+                reminder = {"reminder_id": str(uuid4()), "session_id": session_id, "title": title, "reminder_time": reminder_time, "repeat_rule": repeat_rule, "reminder_date": reminder_date, "created_at": datetime.now().isoformat(), "completed_at": None, "last_triggered_date": None, "last_completed_date": None, "created_by": created_by}
+                conn.execute(
+                    "INSERT INTO reminders (reminder_id, session_id, title, reminder_time, repeat_rule, reminder_date, created_at, completed_at, last_triggered_date, last_completed_date, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    tuple(reminder.values()),
+                )
+                return reminder, False
+
             rows = conn.execute(
                 "SELECT reminder_id, title FROM reminders WHERE session_id = ? AND repeat_rule = 'daily' AND completed_at IS NULL ORDER BY created_at",
                 (session_id,),
@@ -384,9 +458,13 @@ class SQLiteStore:
                     (final_title, reminder_time, reminder_date, created_by, reminder_id),
                 )
                 row = conn.execute("SELECT reminder_id, session_id, title, reminder_time, repeat_rule, reminder_date, created_at, completed_at, last_triggered_date, last_completed_date, created_by FROM reminders WHERE reminder_id = ?", (reminder_id,)).fetchone()
-                keys = ("reminder_id", "session_id", "title", "reminder_time", "repeat_rule", "reminder_date", "created_at", "completed_at", "last_triggered_date", "last_completed_date", "created_by")
                 return dict(zip(keys, row)), True
-        return self.create_reminder(session_id, title, reminder_time, repeat_rule, reminder_date, created_by), False
+            reminder = {"reminder_id": str(uuid4()), "session_id": session_id, "title": title, "reminder_time": reminder_time, "repeat_rule": repeat_rule, "reminder_date": reminder_date, "created_at": datetime.now().isoformat(), "completed_at": None, "last_triggered_date": None, "last_completed_date": None, "created_by": created_by}
+            conn.execute(
+                "INSERT INTO reminders (reminder_id, session_id, title, reminder_time, repeat_rule, reminder_date, created_at, completed_at, last_triggered_date, last_completed_date, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(reminder.values()),
+            )
+            return reminder, False
 
     def list_reminders(self, session_id: str, include_completed: bool = False) -> list[dict]:
         query = "SELECT reminder_id, session_id, title, reminder_time, repeat_rule, reminder_date, created_at, completed_at, last_triggered_date, last_completed_date, created_by FROM reminders WHERE session_id = ?"
@@ -504,15 +582,30 @@ class SQLiteStore:
 
     def add_health_event(self, family_id: str, person_name: str, symptom: str, session_id: str, occurred_at: str | None = None) -> dict:
         now = datetime.now().isoformat()
-        event = {"event_id": str(uuid4()), "family_id": family_id, "person_name": person_name, "symptom": symptom, "source_session_id": session_id, "occurred_at": occurred_at or now, "created_at": now, "expires_at": (datetime.now() + timedelta(days=30)).isoformat()}
+        event = {"event_id": str(uuid4()), "family_id": family_id, "person_name": person_name, "symptom": symptom, "source_session_id": session_id, "occurred_at": occurred_at or now, "created_at": now, "expires_at": (datetime.now() + timedelta(days=30)).isoformat(), "resolved_at": None}
         with self._connect() as conn:
-            conn.execute("INSERT INTO health_events (event_id, family_id, person_name, symptom, source_session_id, occurred_at, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", tuple(event.values()))
+            conn.execute("INSERT INTO health_events (event_id, family_id, person_name, symptom, source_session_id, occurred_at, created_at, expires_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(event.values()))
         return event
+
+    def resolve_health_events(self, family_id: str, person_name: str, symptoms: list[str], resolved_at: str | None = None) -> int:
+        """Mark matching recent symptoms as recovered without deleting history."""
+        values = [item.strip() for item in symptoms if item and item.strip()]
+        if not values:
+            return 0
+        placeholders = ",".join("?" for _ in values)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""UPDATE health_events SET resolved_at = ?
+                WHERE family_id = ? AND person_name = ? AND symptom IN ({placeholders})
+                  AND resolved_at IS NULL AND expires_at > ?""",
+                (resolved_at or datetime.now().isoformat(), family_id, person_name, *values, datetime.now().isoformat()),
+            )
+        return cursor.rowcount
 
     def find_recent_health_events(self, family_id: str, person_name: str, since_iso: str) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT event_id, family_id, person_name, symptom, source_session_id, occurred_at, created_at, expires_at FROM health_events WHERE family_id = ? AND (person_name = ? OR person_name LIKE ?) AND occurred_at >= ? AND expires_at > ? ORDER BY occurred_at DESC, created_at DESC, rowid DESC", (family_id, person_name, f"%{person_name}", since_iso, datetime.now().isoformat())).fetchall()
-        keys = ("event_id", "family_id", "person_name", "symptom", "source_session_id", "occurred_at", "created_at", "expires_at")
+            rows = conn.execute("SELECT event_id, family_id, person_name, symptom, source_session_id, occurred_at, created_at, expires_at, resolved_at FROM health_events WHERE family_id = ? AND (person_name = ? OR person_name LIKE ?) AND occurred_at >= ? AND expires_at > ? ORDER BY occurred_at DESC, created_at DESC, rowid DESC", (family_id, person_name, f"%{person_name}", since_iso, datetime.now().isoformat())).fetchall()
+        keys = ("event_id", "family_id", "person_name", "symptom", "source_session_id", "occurred_at", "created_at", "expires_at", "resolved_at")
         return [dict(zip(keys, row)) for row in rows]
 
     def add_activity_event(self, family_id: str, person_name: str, activity: str, session_id: str, occurred_at: str | None = None) -> dict:
@@ -528,51 +621,184 @@ class SQLiteStore:
         keys = ("event_id", "family_id", "person_name", "activity", "source_session_id", "occurred_at", "created_at", "expires_at")
         return [dict(zip(keys, row)) for row in rows]
 
-    def add_household_member(self, family_id: str, member_name: str, relationship: str = "", age: int | None = None) -> dict:
-        member = {"family_id": family_id, "member_name": member_name.strip(), "relationship": relationship.strip(), "age": age, "created_at": datetime.now().isoformat()}
+    def add_household_member(self, family_id: str, member_name: str, relationship: str = "", age: int | None = None, gender: str = "") -> dict:
+        gender = gender if gender in {"male", "female"} else ""
+        member = {"family_id": family_id, "member_name": member_name.strip(), "relationship": relationship.strip(), "age": age, "gender": gender, "created_at": datetime.now().isoformat()}
         with self._connect() as conn:
             conn.execute(
-                """INSERT INTO household_members (family_id, member_name, relationship, age, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO household_members (family_id, member_name, relationship, age, gender, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(family_id, member_name) DO UPDATE SET
                     relationship=CASE WHEN excluded.relationship != '' THEN excluded.relationship ELSE household_members.relationship END,
-                    age=COALESCE(excluded.age, household_members.age)""",
+                    age=COALESCE(excluded.age, household_members.age),
+                    gender=CASE WHEN excluded.gender != '' THEN excluded.gender ELSE household_members.gender END""",
                 tuple(member.values()),
             )
         return member
 
     def list_household_members(self, family_id: str) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT family_id, member_name, relationship, age, created_at FROM household_members WHERE family_id = ? ORDER BY created_at", (family_id,)).fetchall()
-        return [dict(zip(("family_id", "member_name", "relationship", "age", "created_at"), row)) for row in rows]
+            rows = conn.execute("SELECT family_id, member_name, relationship, age, gender, created_at FROM household_members WHERE family_id = ? ORDER BY created_at", (family_id,)).fetchall()
+        return [dict(zip(("family_id", "member_name", "relationship", "age", "gender", "created_at"), row)) for row in rows]
 
     def find_household_member_by_relationship(self, family_id: str, relationship: str) -> dict | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT family_id, member_name, relationship, age, created_at FROM household_members WHERE family_id = ? AND relationship = ? ORDER BY created_at LIMIT 1", (family_id, relationship)).fetchone()
-        return dict(zip(("family_id", "member_name", "relationship", "age", "created_at"), row)) if row else None
+            row = conn.execute("SELECT family_id, member_name, relationship, age, gender, created_at FROM household_members WHERE family_id = ? AND relationship = ? ORDER BY created_at LIMIT 1", (family_id, relationship)).fetchone()
+        return dict(zip(("family_id", "member_name", "relationship", "age", "gender", "created_at"), row)) if row else None
 
-    def set_family_relationship(self, family_id: str, source_name: str, target_name: str, relation: str) -> dict:
-        record = {"family_id": family_id, "source_name": source_name.strip(), "target_name": target_name.strip(), "relation": relation.strip(), "updated_at": datetime.now().isoformat()}
+    @staticmethod
+    def _inverse_graph_relation(relation: str, source_gender: str = "") -> str | None:
+        if relation in {"爸爸", "妈妈", "父母"}:
+            return "儿子" if source_gender == "male" else ("女儿" if source_gender == "female" else "孩子")
+        if relation in {"爷爷", "奶奶", "外公", "外婆", "祖辈"}:
+            return "孙子" if source_gender == "male" else ("孙女" if source_gender == "female" else "孙辈")
+        if relation in {"儿子", "女儿", "孩子"}:
+            return "爸爸" if source_gender == "male" else ("妈妈" if source_gender == "female" else "父母")
+        if relation in {"孙子", "孙女", "孙辈"}:
+            return "爷爷" if source_gender == "male" else ("奶奶" if source_gender == "female" else "祖辈")
+        if relation == "老伴":
+            return "老伴"
+        return None
+
+    def set_family_relationship(
+        self,
+        family_id: str,
+        source_name: str,
+        target_name: str,
+        relation: str,
+        edge_type: str = "direct",
+        evidence: str = "",
+    ) -> dict:
+        edge_type = "derived" if edge_type == "derived" else "direct"
+        record = {
+            "family_id": family_id, "source_name": source_name.strip(), "target_name": target_name.strip(),
+            "relation": relation.strip(), "edge_type": edge_type, "evidence": evidence.strip(),
+            "updated_at": datetime.now().isoformat(),
+        }
         with self._connect() as conn:
+            # These roles identify one person from a speaker's point of view.
+            # Re-stating one of them updates the old value instead of leaving
+            # two competing targets whose selection depends on timestamps.
+            if edge_type == "direct" and record["relation"] in {"奶奶", "爷爷", "外婆", "外公", "爸爸", "妈妈", "老伴"}:
+                conn.execute(
+                    "DELETE FROM family_relationships WHERE family_id = ? AND source_name = ? AND relation = ? AND target_name <> ?",
+                    (record["family_id"], record["source_name"], record["relation"], record["target_name"]),
+                )
             conn.execute(
-                """INSERT INTO family_relationships (family_id, source_name, target_name, relation, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(family_id, source_name, target_name, relation) DO UPDATE SET updated_at=excluded.updated_at""",
+                """INSERT INTO family_relationships
+                (family_id, source_name, target_name, relation, edge_type, evidence, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(family_id, source_name, target_name, relation) DO UPDATE SET
+                  edge_type=CASE
+                    WHEN family_relationships.edge_type='direct' OR excluded.edge_type='direct' THEN 'direct'
+                    ELSE 'derived' END,
+                  evidence=CASE WHEN excluded.edge_type='direct' THEN excluded.evidence ELSE family_relationships.evidence END,
+                  updated_at=excluded.updated_at""",
                 tuple(record.values()),
             )
+        if edge_type == "direct":
+            self.rebuild_family_graph(family_id)
         return record
+
+    def rebuild_all_family_graphs(self) -> None:
+        with self._connect() as conn:
+            family_ids = [row[0] for row in conn.execute("SELECT DISTINCT family_id FROM family_relationships")]
+        for family_id in family_ids:
+            self.rebuild_family_graph(family_id)
+
+    def rebuild_family_graph(self, family_id: str) -> None:
+        """Rebuild safe inverse and cross-generation edges from direct facts."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM family_relationships WHERE family_id = ? AND edge_type = 'derived'", (family_id,))
+            direct_rows = conn.execute(
+                """SELECT source_name, target_name, relation
+                FROM family_relationships WHERE family_id = ? AND edge_type = 'direct'""",
+                (family_id,),
+            ).fetchall()
+
+            # Gender is inferred only from an explicit gendered kinship word;
+            # never from a person's name.
+            for _, target, relation in direct_rows:
+                gender = RELATION_GENDER.get(relation, "")
+                if gender:
+                    conn.execute(
+                        """UPDATE household_members SET gender = ?
+                        WHERE family_id = ? AND member_name = ? AND gender = ''""",
+                        (gender, family_id, target),
+                    )
+            genders = {
+                name: gender for name, gender in conn.execute(
+                    "SELECT member_name, gender FROM household_members WHERE family_id = ?", (family_id,)
+                ).fetchall()
+            }
+
+            derived: dict[tuple[str, str, str], str] = {}
+
+            def add_edge(source: str, target: str, relation: str | None, evidence: str) -> None:
+                if source and target and source != target and relation:
+                    derived[(source, target, relation)] = evidence
+
+            # Every direct edge gets a safe reverse. Unknown gender produces a
+            # neutral role such as 孩子/孙辈 instead of a guessed 儿子/孙子.
+            for source, target, relation in direct_rows:
+                add_edge(
+                    target, source,
+                    self._inverse_graph_relation(relation, genders.get(source, "")),
+                    f"由{source}→{target}的{relation}关系反推",
+                )
+
+            direct_map = {(source, relation): target for source, target, relation in direct_rows}
+            # Chinese paternal/maternal grandparent terms encode a safe
+            # parent-of-parent path.
+            for child in {source for source, _, _ in direct_rows}:
+                father, mother = direct_map.get((child, "爸爸")), direct_map.get((child, "妈妈"))
+                paternal_grandma = direct_map.get((child, "奶奶"))
+                paternal_grandpa = direct_map.get((child, "爷爷"))
+                maternal_grandma = direct_map.get((child, "外婆"))
+                maternal_grandpa = direct_map.get((child, "外公"))
+                for parent, grandparent, relation in (
+                    (father, paternal_grandma, "妈妈"), (father, paternal_grandpa, "爸爸"),
+                    (mother, maternal_grandma, "妈妈"), (mother, maternal_grandpa, "爸爸"),
+                ):
+                    if parent and grandparent:
+                        evidence = f"由{child}的家庭关系路径推导"
+                        add_edge(parent, grandparent, relation, evidence)
+                        add_edge(
+                            grandparent, parent,
+                            self._inverse_graph_relation(relation, genders.get(parent, "")), evidence,
+                        )
+
+            now = datetime.now().isoformat()
+            for (source, target, relation), evidence in derived.items():
+                conn.execute(
+                    """INSERT INTO family_relationships
+                    (family_id, source_name, target_name, relation, edge_type, evidence, updated_at)
+                    VALUES (?, ?, ?, ?, 'derived', ?, ?)
+                    ON CONFLICT(family_id, source_name, target_name, relation) DO NOTHING""",
+                    (family_id, source, target, relation, evidence, now),
+                )
 
     def find_related_member(self, family_id: str, source_name: str, relation: str) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
-                """SELECT m.family_id, m.member_name, m.relationship, m.age, m.created_at
+                """SELECT m.family_id, m.member_name, m.relationship, m.age, m.gender, m.created_at
                 FROM family_relationships r JOIN household_members m
                   ON m.family_id = r.family_id AND m.member_name = r.target_name
                 WHERE r.family_id = ? AND r.source_name = ? AND r.relation = ?
-                ORDER BY r.updated_at DESC LIMIT 1""",
+                ORDER BY CASE r.edge_type WHEN 'direct' THEN 0 ELSE 1 END, r.updated_at DESC LIMIT 1""",
                 (family_id, source_name, relation),
             ).fetchone()
-        return dict(zip(("family_id", "member_name", "relationship", "age", "created_at"), row)) if row else None
+            if row is None and relation in NEUTRAL_RELATIONS:
+                neutral = NEUTRAL_RELATIONS[relation]
+                rows = conn.execute(
+                    """SELECT DISTINCT m.family_id, m.member_name, m.relationship, m.age, m.gender, m.created_at
+                    FROM family_relationships r JOIN household_members m
+                      ON m.family_id = r.family_id AND m.member_name = r.target_name
+                    WHERE r.family_id = ? AND r.source_name = ? AND r.relation = ?""",
+                    (family_id, source_name, neutral),
+                ).fetchall()
+                row = rows[0] if len(rows) == 1 else None
+        return dict(zip(("family_id", "member_name", "relationship", "age", "gender", "created_at"), row)) if row else None
 
     def find_member_by_spoken_relation(self, family_id: str, source_name: str, relation: str) -> dict | None:
         """Resolve a speaker's '奶奶/爸爸…' to one concrete household member.
@@ -582,40 +808,32 @@ class SQLiteStore:
         A reverse lookup is only used when it has exactly one candidate, so a
         phrase like “我奶奶” never silently chooses between two grandparents.
         """
-        direct = self.find_related_member(family_id, source_name, relation)
-        if direct:
-            return direct
-        inverse_relations = {
-            "奶奶": ("孙子", "孙女"), "爷爷": ("孙子", "孙女"),
-            "外婆": ("孙子", "孙女"), "外公": ("孙子", "孙女"),
-            "爸爸": ("儿子", "女儿"), "妈妈": ("儿子", "女儿"),
-        }.get(relation, ())
-        if not inverse_relations:
-            return None
-        placeholders = ", ".join("?" for _ in inverse_relations)
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""SELECT DISTINCT m.family_id, m.member_name, m.relationship, m.age, m.created_at
-                FROM family_relationships r JOIN household_members m
-                  ON m.family_id = r.family_id AND m.member_name = r.source_name
-                WHERE r.family_id = ? AND r.target_name = ? AND r.relation IN ({placeholders})""",
-                (family_id, source_name, *inverse_relations),
-            ).fetchall()
-        if len(rows) != 1:
-            return None
-        return dict(zip(("family_id", "member_name", "relationship", "age", "created_at"), rows[0]))
+        return self.find_related_member(family_id, source_name, relation)
 
     def list_member_relationships(self, family_id: str, source_name: str) -> list[dict]:
-        """Return direct, user-stated relationships for one household member."""
+        """Return direct and safely derived relationships for one member."""
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT target_name, relation, updated_at
+                """SELECT target_name, relation, edge_type, evidence, updated_at
                 FROM family_relationships
                 WHERE family_id = ? AND source_name = ?
-                ORDER BY updated_at DESC""",
+                ORDER BY CASE edge_type WHEN 'direct' THEN 0 ELSE 1 END, updated_at DESC""",
                 (family_id, source_name),
             ).fetchall()
-        return [dict(zip(("target_name", "relation", "updated_at"), row)) for row in rows]
+        return [dict(zip(("target_name", "relation", "edge_type", "evidence", "updated_at"), row)) for row in rows]
+
+    def list_family_relationship_graph(self, family_id: str) -> list[dict]:
+        """Return the inspectable edge list for one household relationship graph."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT source_name, target_name, relation, edge_type, evidence, updated_at
+                FROM family_relationships WHERE family_id = ?
+                ORDER BY source_name, CASE edge_type WHEN 'direct' THEN 0 ELSE 1 END,
+                         relation, target_name""",
+                (family_id,),
+            ).fetchall()
+        keys = ("source_name", "target_name", "relation", "edge_type", "evidence", "updated_at")
+        return [dict(zip(keys, row)) for row in rows]
 
     def repair_relationship_target(self, family_id: str, source_name: str, old_target: str, new_target: str) -> bool:
         """Repair a malformed relationship target without deleting member data."""
@@ -637,7 +855,10 @@ class SQLiteStore:
                 "DELETE FROM family_relationships WHERE family_id = ? AND source_name = ? AND target_name = ?",
                 (family_id, source_name, old_target),
             )
-        return cursor.rowcount > 0
+        repaired = cursor.rowcount > 0
+        if repaired:
+            self.rebuild_family_graph(family_id)
+        return repaired
 
     def upsert_family_fact(self, family_id: str, subject_name: str, fact_key: str, fact_value: str, session_id: str) -> dict:
         """Persist one explicitly stated, long-term family fact (not chat text)."""
@@ -658,6 +879,37 @@ class SQLiteStore:
             )
         return fact
 
+    def remove_family_fact(self, family_id: str, subject_name: str, fact_key: str, fact_value: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM family_facts WHERE family_id = ? AND subject_name = ? AND fact_key = ? AND fact_value = ?",
+                (family_id, subject_name, fact_key, fact_value),
+            )
+        return cursor.rowcount > 0
+
+    def upsert_family_preference(self, family_id: str, subject_name: str, category: str, item: str, polarity: str, session_id: str) -> dict:
+        """Store one durable preference and replace its opposite state."""
+        now = datetime.now().isoformat()
+        fact_key = f"偏好:{category}"
+        fact_value = f"{polarity}:{item}"
+        fact = {
+            "fact_id": str(uuid4()), "family_id": family_id, "subject_name": subject_name,
+            "fact_key": fact_key, "fact_value": fact_value, "source_session_id": session_id,
+            "created_at": now, "updated_at": now,
+        }
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM family_facts WHERE family_id = ? AND subject_name = ? AND fact_key = ? AND fact_value IN (?, ?)",
+                (family_id, subject_name, fact_key, f"like:{item}", f"dislike:{item}"),
+            )
+            conn.execute(
+                """INSERT INTO family_facts
+                (fact_id, family_id, subject_name, fact_key, fact_value, source_session_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(fact.values()),
+            )
+        return fact
+
     def list_family_facts(self, family_id: str, subject_name: str) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -670,8 +922,8 @@ class SQLiteStore:
 
     def get_household_member(self, family_id: str, member_name: str) -> dict | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT family_id, member_name, relationship, age, created_at FROM household_members WHERE family_id = ? AND member_name = ?", (family_id, member_name)).fetchone()
-        return dict(zip(("family_id", "member_name", "relationship", "age", "created_at"), row)) if row else None
+            row = conn.execute("SELECT family_id, member_name, relationship, age, gender, created_at FROM household_members WHERE family_id = ? AND member_name = ?", (family_id, member_name)).fetchone()
+        return dict(zip(("family_id", "member_name", "relationship", "age", "gender", "created_at"), row)) if row else None
 
     def remove_household_member(self, family_id: str, member_name: str) -> bool:
         """Delete one member's profile and family-scoped memories permanently."""
@@ -692,4 +944,7 @@ class SQLiteStore:
                 conn.execute("DELETE FROM session_locations WHERE session_id = ?", (web_session_id,))
                 conn.execute("DELETE FROM device_modes WHERE device_id = ?", (web_session_id,))
                 conn.execute("DELETE FROM device_configs WHERE device_id = ?", (web_session_id,))
-        return cursor.rowcount > 0
+        removed = cursor.rowcount > 0
+        if removed:
+            self.rebuild_family_graph(family_id)
+        return removed

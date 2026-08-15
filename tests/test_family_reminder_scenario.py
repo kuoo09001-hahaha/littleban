@@ -14,6 +14,13 @@ if str(AGENT_ROOT) not in sys.path:
 
 
 class FamilyReminderScenarioTest(unittest.TestCase):
+    def test_relationship_questions_do_not_create_fake_members(self):
+        from services.family_fact_service import extract_named_relationship
+
+        self.assertIsNone(extract_named_relationship("你记得我奶奶是谁吗"))
+        self.assertIsNone(extract_named_relationship("我奶奶是王秀芬吗？"))
+        self.assertEqual(extract_named_relationship("我奶奶是王秀芬，今年68岁"), ("奶奶", "王秀芬"))
+
     """Models the same separate pages/sessions that the web UI uses."""
 
     def test_xiaoming_and_wangxiufen_can_set_cross_member_reminders(self):

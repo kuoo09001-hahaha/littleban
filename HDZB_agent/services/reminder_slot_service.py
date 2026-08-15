@@ -24,7 +24,10 @@ def extract_time(text: str) -> str | None:
     """Extract a HH:MM time from a natural Chinese follow-up utterance."""
     patterns = [
         (r"(明早|明天早上|早上|上午|中午|下午|晚上)?\s*(\d{1,2}|[零一二两三四五六七八九十]{1,3})点(?:\s*(\d{1,2})分?)?", "chinese"),
-        (r"\b(\d{1,2}):(\d{2})\b", "colon"),
+        # ``\b`` does not separate Chinese characters from digits because
+        # both are Unicode word characters. Digit lookarounds correctly match
+        # compact phrases such as “晚上20:10吃药”.
+        (r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", "colon"),
     ]
     for pattern, kind in patterns:
         match = re.search(pattern, text)

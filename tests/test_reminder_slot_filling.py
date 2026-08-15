@@ -19,6 +19,16 @@ class ReminderSlotFillingTest(unittest.TestCase):
         self.assertEqual(extract_time("明天早上八点啊"), "08:00")
         self.assertEqual(extract_reminder_date("明早八点上课"), (date.today() + timedelta(days=1)).isoformat())
 
+    def test_extracts_colon_time_adjacent_to_chinese_text(self):
+        from services.reminder_slot_service import extract_time
+        from tools.intent_tools import IntentAnalyzerTool
+
+        text = "帮我奶奶设置今天晚上20:10吃药的提醒"
+        self.assertEqual(extract_time(text), "20:10")
+        intent = IntentAnalyzerTool()._extract_local_reminder_intent(text)
+        self.assertEqual(intent["alarm_info"]["display_time"], "20:10")
+        self.assertFalse(intent["alarm_info"]["needs_time"])
+
     def test_pending_reminder_survives_store_recreation(self):
         from storage.sqlite_store import SQLiteStore
         with tempfile.TemporaryDirectory() as directory:

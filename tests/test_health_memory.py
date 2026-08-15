@@ -70,5 +70,23 @@ class HealthMemoryTest(unittest.TestCase):
             events = store.find_recent_health_events("family-a", "奶奶", (datetime.now() - timedelta(days=1)).isoformat())
             self.assertEqual(events[0]["symptom"], "头晕")
 
+    def test_health_event_response_includes_relative_date_and_time(self):
+        from services.health_memory_service import format_events
+
+        occurred_at = datetime.now().replace(hour=9, minute=20, second=0, microsecond=0).isoformat()
+        response = format_events("王秀芬", [{"symptom": "头疼", "occurred_at": occurred_at}])
+        self.assertIn("今天上午09:20提到过头疼", response)
+
+    def test_resolved_health_event_is_reported_as_history_not_current_symptom(self):
+        from services.health_memory_service import format_events
+
+        occurred_at = datetime.now().replace(hour=9, minute=20, second=0, microsecond=0).isoformat()
+        resolved_at = datetime.now().replace(hour=10, minute=10, second=0, microsecond=0).isoformat()
+        response = format_events("王秀芬", [{
+            "symptom": "头疼", "occurred_at": occurred_at, "resolved_at": resolved_at,
+        }])
+        self.assertIn("提到过头疼", response)
+        self.assertIn("表示已经好了", response)
+
 if __name__ == "__main__":
     unittest.main()

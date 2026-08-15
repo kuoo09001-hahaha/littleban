@@ -119,6 +119,83 @@ class HouseholdMembersTest(unittest.TestCase):
             self.assertEqual(store.list_member_relationships("family-a", "小明")[0]["target_name"], "王刚")
             self.assertEqual(store.list_family_facts("family-a", "小明")[0]["fact_value"], "游泳")
 
+    def test_family_graph_derives_reverse_and_cross_generation_relationships(self):
+        from storage.sqlite_store import SQLiteStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "agent.db")
+            for name, age in (("小明", 12), ("王刚", 42), ("王芳", 40), ("王秀芬", 68), ("王建国", 70)):
+                store.add_household_member("family-a", name, age=age)
+            store.set_family_relationship("family-a", "小明", "王刚", "爸爸")
+            store.set_family_relationship("family-a", "小明", "王芳", "妈妈")
+            store.set_family_relationship("family-a", "小明", "王秀芬", "奶奶")
+            store.set_family_relationship("family-a", "小明", "王建国", "爷爷")
+
+            self.assertEqual(store.find_related_member("family-a", "王刚", "妈妈")["member_name"], "王秀芬")
+            self.assertEqual(store.find_related_member("family-a", "王刚", "爸爸")["member_name"], "王建国")
+            self.assertEqual(store.find_member_by_spoken_relation("family-a", "王秀芬", "儿子")["member_name"], "王刚")
+            # 小明未提供性别时，图中保存中性的“孙辈/孩子”，但用户以
+            # 单数“孙子/儿子”查询且候选唯一时仍能安全解析。
+            self.assertEqual(store.find_member_by_spoken_relation("family-a", "王秀芬", "孙子")["member_name"], "小明")
+            self.assertEqual(store.find_member_by_spoken_relation("family-a", "王芳", "儿子")["member_name"], "小明")
+            self.assertIsNone(store.find_related_member("family-a", "王刚", "老伴"))
+
+            grandma_edges = store.list_member_relationships("family-a", "王秀芬")
+            self.assertTrue(any(item["edge_type"] == "derived" and item["evidence"] for item in grandma_edges))
+
+    def test_family_graph_rebuild_removes_stale_derived_edges(self):
+        from storage.sqlite_store import SQLiteStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "agent.db")
+            for name in ("小明", "王刚", "王秀芬", "李秀兰"):
+                store.add_household_member("family-a", name)
+            store.set_family_relationship("family-a", "小明", "王刚", "爸爸")
+            store.set_family_relationship("family-a", "小明", "王秀芬", "奶奶")
+            self.assertEqual(store.find_related_member("family-a", "王刚", "妈妈")["member_name"], "王秀芬")
+
+            store.set_family_relationship("family-a", "小明", "李秀兰", "奶奶")
+            self.assertEqual(store.find_related_member("family-a", "王刚", "妈妈")["member_name"], "李秀兰")
+            self.assertFalse(any(
+                item["target_name"] == "王秀芬" and item["relation"] == "妈妈"
+                for item in store.list_member_relationships("family-a", "王刚")
+            ))
+
+    def test_neutral_relation_does_not_guess_when_multiple_candidates_exist(self):
+        from storage.sqlite_store import SQLiteStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "agent.db")
+            for name in ("王芳", "小明", "小红"):
+                store.add_household_member("family-a", name)
+            store.set_family_relationship("family-a", "小明", "王芳", "妈妈")
+            store.set_family_relationship("family-a", "小红", "王芳", "妈妈")
+            self.assertIsNone(store.find_member_by_spoken_relation("family-a", "王芳", "儿子"))
+
+    def test_switched_member_context_contains_the_whole_family_graph(self):
+        from services.family_fact_service import format_persistent_context
+        from storage.sqlite_store import SQLiteStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "agent.db")
+            for name in ("小明", "王刚", "王芳", "王秀芬"):
+                store.add_household_member("family-a", name)
+            store.set_family_relationship("family-a", "小明", "王刚", "爸爸")
+            store.set_family_relationship("family-a", "小明", "王芳", "妈妈")
+            store.set_family_relationship("family-a", "小明", "王秀芬", "奶奶")
+
+            context = format_persistent_context(
+                store.get_household_member("family-a", "王芳"),
+                store.list_member_relationships("family-a", "王芳"),
+                [],
+                store.list_family_relationship_graph("family-a"),
+            )
+
+            self.assertIn("家庭关系图", context)
+            self.assertIn("小明的爸爸是王刚（明确）", context)
+            self.assertIn("王刚的妈妈是王秀芬（安全推导）", context)
+            self.assertNotIn("王刚的老伴是王芳", context)
+
 
 if __name__ == "__main__":
     unittest.main()

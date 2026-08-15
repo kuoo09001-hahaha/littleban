@@ -16,6 +16,13 @@ def create_family_router(get_store) -> APIRouter:
     async def list_members(family_id: str):
         return {"family_id": family_id, "members": get_store().list_household_members(family_id)}
 
+    @router.get("/agent/families/{family_id}/relationships")
+    async def list_relationship_graph(family_id: str):
+        return {
+            "family_id": family_id,
+            "relationships": get_store().list_family_relationship_graph(family_id),
+        }
+
     @router.post("/agent/families/{family_id}/members")
     async def add_member(family_id: str, request: FamilyMemberRequest):
         name = request.member_name.strip()

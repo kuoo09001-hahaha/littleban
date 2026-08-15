@@ -26,6 +26,7 @@ class AgentResponse(BaseModel):
     tool_used: Optional[bool] = Field(False, description="是否使用了工具")
     tool_results: Optional[List[Dict[str, Any]]] = Field(None, description="工具调用结果")
     command_type: Optional[str] = Field(None, description="系统指令类型")
+    alarm_control: Optional[Dict[str, Any]] = Field(None, description="设备闹钟控制及接收人信息")
     metadata: Optional[Dict[str, Any]] = Field(None, description="元数据信息")
     reminder: Optional[Dict[str, Any]] = Field(None, description="由提醒指令创建的本地提醒")
 
